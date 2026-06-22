@@ -1,0 +1,108 @@
+// SBCollision.usf
+//
+// Runs AFTER the distance solver and BEFORE Finalize, operating on the solved
+// predicted positions in place. For each particle we test against every collider
+// and, if penetrating, project the position out to the collider surface, then apply
+// simple Coulomb-style friction by damping the tangential component of this step's
+// motion. A built-in infinite ground plane (normal +Z) gives the SB-M1 drop test a
+// floor to rest on.
+//
+// Both shapes are capsules (segment A-B + radius); a sphere is the A == B case, so
+// one routine covers both. Each thread reads/writes only its own particle, so the
+// predicted buffer can be bound as a read-write UAV with no data races.
+//
+// Ported from ClothCollision.usf (the self/distance-field collision paths are not
+// carried over for SB-M1).
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+struct FCollider
+{
+	float3	A;
+	float	Radius;
+	float3	B;
+	float	Friction;
+};
+
+RWStructuredBuffer<float3>	PredictedPositions;	// in/out (solved positions)
+StructuredBuffer<float3>	PrevPositions;		// position at start of substep
+StructuredBuffer<float>		InvMasses;
+StructuredBuffer<FCollider>	Colliders;
+
+uint	NumParticles;
+uint	NumColliders;
+float	ContactOffset;	// small skin thickness so the body rests just off the surface
+
+// Optional infinite ground plane (normal +Z) at world height GroundZ.
+uint	EnableGround;
+float	GroundZ;
+float	GroundFriction;	// [0..1] tangential damping on the ground
+
+float3 ClosestPointOnSegment(float3 P, float3 A, float3 B)
+{
+	const float3 AB = B - A;
+	const float DenomSq = max(dot(AB, AB), 1e-8f);
+	const float T = saturate(dot(P - A, AB) / DenomSq);
+	return A + T * AB;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+	if (InvMasses[Index] <= 0.0f)
+	{
+		return; // pinned: don't collide-move it
+	}
+
+	float3 P = PredictedPositions[Index];
+	const float3 Prev = PrevPositions[Index];
+
+	for (uint c = 0; c < NumColliders; ++c)
+	{
+		const FCollider Col = Colliders[c];
+
+		const float3 CP = ClosestPointOnSegment(P, Col.A, Col.B);
+		float3 D = P - CP;
+		const float Dist = length(D);
+		const float MinDist = Col.Radius + ContactOffset;
+
+		if (Dist < MinDist)
+		{
+			// Surface normal (guard the degenerate "exactly at centre" case).
+			const float3 N = (Dist > 1e-5f) ? (D / Dist) : float3(0.0f, 0.0f, 1.0f);
+
+			// Project out to the surface.
+			P = CP + N * MinDist;
+
+			// Friction: damp the tangential part of this step's motion.
+			const float3 Step = P - Prev;
+			const float3 StepN = dot(Step, N) * N;
+			const float3 StepT = Step - StepN;
+			P -= Col.Friction * StepT;
+		}
+	}
+
+	// Infinite ground plane (normal +Z). Runs after the colliders.
+	if (EnableGround != 0)
+	{
+		const float MinZ = GroundZ + ContactOffset;
+		if (P.z < MinZ)
+		{
+			P.z = MinZ;
+			// Tangential motion is the XY part of this step; damp it for friction.
+			const float2 StepT = P.xy - Prev.xy;
+			P.xy -= GroundFriction * StepT;
+		}
+	}
+
+	PredictedPositions[Index] = P;
+}

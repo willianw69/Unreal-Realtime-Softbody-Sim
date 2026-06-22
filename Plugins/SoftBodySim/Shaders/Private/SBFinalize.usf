@@ -1,0 +1,46 @@
+// SBFinalize.usf
+//
+// Step 3: commit the solved positions and derive the new velocity.
+// This is the heart of why PBD is stable: velocity is NOT integrated from forces,
+// it is read back from how far the solver actually moved the particle this substep:
+//     v = (p_solved - x_old) / dt
+// Any motion the constraints removed (e.g. a stretch that got corrected) is
+// automatically reflected as reduced velocity, so energy can't blow up.
+//
+// Ported verbatim from ClothFinalize.usf.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+StructuredBuffer<float3>	PredictedPositions;
+StructuredBuffer<float>		InvMasses;
+RWStructuredBuffer<float3>	Positions;
+RWStructuredBuffer<float3>	Velocities;
+
+uint	NumParticles;
+float	InvSubDeltaTime;	// 1 / SubDeltaTime
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	if (InvMasses[Index] <= 0.0f)
+	{
+		Velocities[Index] = float3(0.0f, 0.0f, 0.0f); // pinned: stays put, no drift
+		return;
+	}
+
+	const float3 P = PredictedPositions[Index];
+	const float3 X = Positions[Index];
+
+	Velocities[Index] = (P - X) * InvSubDeltaTime;
+	Positions[Index] = P;
+}

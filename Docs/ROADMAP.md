@@ -1,12 +1,12 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-22.
+> Last updated: 2026-06-22 (SB-M1 complete + verified in-editor).
 
 | Milestone | Title | Status |
 |---|---|---|
 | M0 | Project bootstrap (C++ host builds) | ✅ |
-| SB-M1 | GPU lattice solid (framework port + distance constraints) | ⏳ |
+| SB-M1 | GPU lattice solid (framework port + distance constraints) | ✅ |
 | SB-M2 | Volume constraints → jelly (tetrahedra) | ⏳ |
 | SB-M3 | Mouse dragging (pick + grab constraint) | ⏳ |
 | SB-M4 | Collisions (ground / sphere / self) | ⏳ |
@@ -18,18 +18,24 @@
 `SoftBodyDemo` UE 5.7 C++ host project created (uproject, Target.cs ×2, Build.cs, module, Config,
 .gitignore/.gitattributes) mirroring `ClothSimDemo`. Builds clean via CLI. No plugin yet.
 
-### SB-M1 — GPU lattice solid ⏳ (do this first)
-Create `Plugins/SoftBodySim` by porting the ClothSim GPU framework. Runtime-generate a 3D particle
-**lattice** (box) and **distance constraints**, graph-colored. Pipeline: `SBPredict` → colored
-Gauss-Seidel distance solve → `SBFinalize` → readback. Render the box boundary as a lit mesh via a
-ported `FSoftBodyMeshProxy`. Add a built-in **ground plane** and an **anchor** option (pin one face)
-for the first test. **Result:** a springy deformable box that falls, jiggles, and rests on the floor
-(volume not yet preserved — expected). Proves the full 3D GPU pipeline.
+### SB-M1 — GPU lattice solid ✅ (verified in-editor 2026-06-22)
+Created `Plugins/SoftBodySim` by porting the ClothSim GPU framework. Runtime-generates a 3D particle
+**lattice** (centered box), the **6-tet Kuhn split** of every cube cell, and **distance constraints**
+deduped from the unique tet edges (cube edges + face diagonals + body diagonal), greedily graph-colored.
+Pipeline: `SBPredict` (gravity+damping) → colored Gauss-Seidel distance solve (in place) → `SBCollision`
+(ground plane) → `SBFinalize` → readback. Renders the box boundary surface as a lit mesh via the ported
+`FSoftBodyMeshSceneProxy` (`Cross(E2,E1)` smooth normals, winding oriented outward). Built-in ground plane
++ an `Anchor` option (None / Top face / Bottom face). **Result:** a springy deformable box that falls,
+jiggles/sags, and rests on the floor (volume not yet preserved — expected). The full 3D GPU pipeline works.
+Note: tetrahedra are already built here (not deferred to SB-M2) because the distance constraints derive
+from tet edges — so SB-M2 only needs to add a second (volume) constraint set over the existing `Tets`.
 
-### SB-M2 — Volume constraints → jelly ⏳
-Generate **tetrahedra** (6-tet Kuhn split per cell) + per-tet **volume constraints**
-(`SBSolveVolume.usf`), graph-colored as a second constraint set. Volume preserved → jelly. The
-headline feature. Tune distance-vs-volume relative stiffness + iterations.
+### SB-M2 — Volume constraints → jelly ⏳ (do this next)
+Add per-tet **volume constraints** (`SBSolveVolume.usf`) over the **already-built** `Tets` array
+(6-tet Kuhn split, computed in SB-M1), graph-colored as a **second** constraint set with its own
+color ranges and per-color dispatches. Rest volume `V0 = (1/6)·dot(e1, e2×e3)`; PBD `C = V − V0`,
+gradients = cross products of opposing edges, move all 4 verts mass-weighted. Volume preserved → jelly.
+The headline feature. Tune distance-vs-volume relative stiffness + iterations.
 
 ### SB-M3 — Mouse dragging ⏳
 Deproject cursor → ray; pick nearest boundary particle (CPU from readback); push grab target; grab

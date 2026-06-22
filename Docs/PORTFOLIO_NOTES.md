@@ -44,4 +44,31 @@ generalizes across simulation types.
 
 ---
 
-<!-- Per-milestone sections (SB-M1 …) go here as they are completed, like the cloth project. -->
+## SB-M1 — GPU lattice solid (framework port) ✅ 2026-06-22
+**Shipped:** A from-scratch GPU soft body plugin (`SoftBodySim`) in UE 5.7, running the full pipeline
+end-to-end: a runtime-generated 3D particle lattice is decomposed into tetrahedra (6-tet Kuhn split),
+distance constraints are derived from the unique tet edges and graph-colored, solved on the GPU with a
+colored Gauss-Seidel relaxation (compute shaders + RDG), collided against a ground plane, and rendered
+as a dynamic lit mesh via a custom `FPrimitiveSceneProxy`. A box drops, jiggles, and settles on the floor.
+
+**Talking points proven in M1:**
+- **Framework generalization, concretely demonstrated:** ~75% of the from-scratch *cloth* GPU framework
+  (RDG dispatch + shader-class boilerplate, pooled/transient buffer split, predict/finalize, colored
+  Gauss-Seidel solver, non-stalling readback rendering, `FLocalVertexFactory` proxy) transferred to a new
+  3D simulation domain with the solver math unchanged — the constraint solver is topology-agnostic, so a
+  tetrahedral lattice's edges relax exactly like a cloth grid's. Strong systems-design / reuse signal.
+- **Runtime topology generation:** lattice → 6-tet Kuhn/Freudenthal decomposition (face-conforming by
+  sharing a consistent cell diagonal) → edge dedup via 64-bit (min,max) keys → greedy graph coloring so
+  each color is a race-free, in-place, per-color GPU dispatch.
+- **Boundary-surface rendering with correct two-sided lighting:** per-quad winding chosen so the
+  `Cross(E2,E1)` smooth normals face outward, matching UE's left-handed front-face convention.
+- **GPU/CPU threading discipline in UE:** game thread builds topology + pushes a param snapshot; render
+  thread owns all sim state (pooled buffers registered into a fresh RDG each frame) and runs the compute
+  passes; a fenced, non-stalling readback feeds the render verts.
+
+**Engineering war story (interview-ready):** a `TArray<FSoftBodyTet>` value member with only a
+forward-declared element type compiled fine in isolation but broke in the UHT-generated `.gen.cpp`
+destructor (incomplete-type, C2672) — a concrete lesson in how Unreal's code generation changes the
+rules around incomplete types vs. a hand-written class.
+
+<!-- Append SB-M2, SB-M3, … sections below as milestones are completed. -->

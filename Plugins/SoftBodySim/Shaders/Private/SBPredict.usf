@@ -1,0 +1,53 @@
+// SBPredict.usf
+//
+// Step 1 of the substep loop. Applies gravity and damping to a LOCAL copy of
+// velocity, then predicts a candidate position. We do NOT write velocity here: in
+// PBD/XPBD the authoritative velocity is re-derived from the position change in the
+// Finalize pass (this is what keeps PBD stable — see SBFinalize.usf).
+//
+// Adapted from ClothPredict.usf with the cloth-specific wind/aero force dropped: a
+// solid soft body has no thin surface to billow.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+StructuredBuffer<float3>	Positions;
+StructuredBuffer<float3>	Velocities;
+StructuredBuffer<float>		InvMasses;
+RWStructuredBuffer<float3>	PredictedPositions;
+
+uint	NumParticles;
+float	SubDeltaTime;
+float3	Gravity;
+float	Damping;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	const float3 X = Positions[Index];
+
+	if (InvMasses[Index] <= 0.0f)
+	{
+		PredictedPositions[Index] = X; // pinned / anchored
+		return;
+	}
+
+	float3 V = Velocities[Index];
+
+	// Gravity.
+	V += Gravity * SubDeltaTime;
+
+	// Damping (frame-rate independent).
+	V *= saturate(1.0f - Damping * SubDeltaTime);
+
+	PredictedPositions[Index] = X + V * SubDeltaTime;
+}

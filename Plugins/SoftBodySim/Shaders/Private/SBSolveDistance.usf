@@ -1,0 +1,90 @@
+// SBSolveDistance.usf
+//
+// Step 2: one color of a graph-colored Gauss-Seidel distance solve.
+//
+// PARALLELISM STRATEGY (the important bit):
+//   One thread per CONSTRAINT, not per particle. The constraint buffer is sorted by
+//   color, and the CPU colored it so that no two constraints in the same color share
+//   a particle. The caller therefore dispatches ONE color at a time over the range
+//   [ColorStart, ColorStart + ColorCount): every thread in a dispatch writes a
+//   DISJOINT pair of particle slots, so the position buffer can be a read-write UAV
+//   with no atomics and no data races. Because each color pass reads the previous
+//   color's writes (RDG serializes the UAV accesses), this is true Gauss-Seidel:
+//   later constraints see the corrections made by earlier ones, which converges much
+//   faster than a Jacobi gather.
+//
+// This is Position Based Dynamics: move both endpoints to satisfy
+//   C = |pa - pb| - restLength = 0
+// split by inverse mass. StiffScale is the constraint's relative stiffness; the
+// global Stiffness uniform scales it.
+//
+// Ported verbatim from ClothSolveGaussSeidel.usf — the solver is topology-agnostic,
+// so a tetrahedral lattice's edges solve exactly like a cloth grid's.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+// Must match FGPUConstraint in SoftBodyResources.h (16 bytes).
+struct FConstraint
+{
+	uint	IndexA;
+	uint	IndexB;
+	float	RestLength;
+	float	StiffScale;
+};
+
+StructuredBuffer<FConstraint>	Constraints;
+StructuredBuffer<float>			InvMasses;
+RWStructuredBuffer<float3>		Positions;	// in/out (predicted positions, solved in place)
+
+uint	ColorStart;		// first constraint index of this color
+uint	ColorCount;		// number of constraints in this color
+float	Stiffness;		// [0,1] global correction scale
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Local = DispatchThreadId.x;
+	if (Local >= ColorCount)
+	{
+		return;
+	}
+
+	const FConstraint C = Constraints[ColorStart + Local];
+
+	const float Wa = InvMasses[C.IndexA];
+	const float Wb = InvMasses[C.IndexB];
+	const float WSum = Wa + Wb;
+	if (WSum <= 1e-8f)
+	{
+		return; // both endpoints pinned
+	}
+
+	const float3 Pa = Positions[C.IndexA];
+	const float3 Pb = Positions[C.IndexB];
+	const float3 D = Pa - Pb;
+	const float Len = length(D);
+	if (Len <= 1e-6f)
+	{
+		return; // coincident; avoid divide-by-zero
+	}
+
+	const float Err = Len - C.RestLength;          // constraint error
+	const float3 N = D / Len;                       // gradient direction
+	const float K = saturate(Stiffness * C.StiffScale);
+	const float3 Corr = K * Err * N;
+
+	// Mass-weighted split. Pinned endpoints (w == 0) don't move; the other endpoint
+	// absorbs the full correction because WSum == the free endpoint's weight.
+	if (Wa > 0.0f)
+	{
+		Positions[C.IndexA] = Pa - (Wa / WSum) * Corr;
+	}
+	if (Wb > 0.0f)
+	{
+		Positions[C.IndexB] = Pb + (Wb / WSum) * Corr;
+	}
+}

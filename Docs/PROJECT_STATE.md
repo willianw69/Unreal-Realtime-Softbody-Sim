@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 > Single source of truth for current project status. Update after every milestone.
-> Last updated: 2026-06-22 (project bootstrap + plan; SB-M1 not yet started).
+> Last updated: 2026-06-22 (SB-M1 complete + verified in-editor; SB-M2 is next).
 
 ## Project Overview
 Real-time **GPU soft body simulation built from scratch** in **Unreal Engine 5.7**, as a
@@ -24,19 +24,26 @@ constraints** · **mouse dragging** · **volume preservation (jelly)** · UE 5.7
 similar to Obi/Zibra soft body.
 
 ## Current Milestone
-**M0 — Project bootstrap: COMPLETE.** `SoftBodyDemo` C++ host project created and **builds clean**
-via the CLI (UHT + module → `UnrealEditor-SoftBodyDemo.dll`). No plugin yet. Design + docs done.
+**SB-M1 — GPU lattice solid: COMPLETE + verified in-editor (2026-06-22).** The `SoftBodySim` plugin
+exists and runs: a box lattice falls under gravity, jiggles/sags via GPU distance constraints, and
+rests on the built-in ground plane. Rendered as a lit two-sided mesh. Volume not yet preserved (SB-M2).
 
 ## Completed Milestones
 - **M0 — Bootstrap.** UE 5.7 C++ host project `SoftBodyDemo` (BuildSettings V6, DX12,
   `r.ShaderDevelopmentMode=1`). Mirrors the cloth host scaffolding. Verified compiling.
+- **SB-M1 — GPU lattice solid.** Created `Plugins/SoftBodySim` (ported ClothSim framework):
+  `SoftBodySim.uplugin`/module (shader path `/SoftBodySim`), `SoftBodyResources.h`, 4 compute shaders
+  (`SBPredict`/`SBSolveDistance`/`SBCollision`/`SBFinalize`), `SoftBodyCompute.cpp` (RDG dispatch),
+  `USoftBodyComponent`, `FSoftBodyMeshSceneProxy`, `ASoftBodyActor`. Runtime-builds a centered box
+  lattice, the 6-tet Kuhn split per cell, deduped distance constraints from tet edges + greedy graph
+  coloring, and the boundary surface; pipeline Predict → colored Gauss-Seidel → ground collision →
+  Finalize → readback → lit mesh. Built-in ground plane + face anchor option. Verified in-editor.
 
 ## Next Milestone
-**SB-M1 — GPU lattice solid (framework port).** Create the `SoftBodySim` plugin by porting the
-ClothSim GPU framework; generate a 3D particle **lattice** (box) + **distance constraints** at
-runtime, graph-colored; run Predict → Solve (colored Gauss-Seidel) → Finalize → readback; render
-the box surface as a lit mesh. Result: a springy deformable box (volume not yet preserved — that's
-SB-M2). See `ROADMAP.md` and `HANDOFF.md`.
+**SB-M2 — Volume constraints → jelly.** Add per-tet **volume constraints** (`SBSolveVolume.usf`) over
+the `Tets` array already built in SB-M1, graph-colored as a **second** constraint set (own color ranges
++ per-color dispatches). Rest volume `V0=(1/6)·dot(e1,e2×e3)`; PBD `C=V−V0`, gradients = cross of
+opposing edges, all 4 verts moved mass-weighted. Volume preserved → jelly. See `ROADMAP.md`/`HANDOFF.md`.
 
 ## Technical Decisions
 - **Method:** tetrahedral XPBD — a particle lattice filled with tetrahedra; solve **distance**

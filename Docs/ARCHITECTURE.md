@@ -1,8 +1,17 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-22 (design; SB-M1 not yet implemented).
+> Last updated: 2026-06-22 (SB-M1 implemented + verified — the pipeline below is now real, minus the
+> volume constraint set, which is SB-M2).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
+
+**SB-M1 status note:** everything below is implemented EXCEPT the volume constraint set. The lattice,
+the **6-tet Kuhn decomposition** (`USoftBodyComponent::BuildTets`), the distance constraints derived
+from unique tet edges + graph coloring, the boundary surface, the `SBPredict → colored-GS
+SBSolveDistance → SBCollision (ground) → SBFinalize → readback` pipeline, and the `FSoftBodyMeshSceneProxy`
+render path all exist and run. SB-M2 adds the second (volume) constraint set over the already-built
+`Tets` array; the "PredictedA/B ping-pong" row below is currently a single in-place `Predicted` buffer
+(colored GS + collision both solve in place, so no ping-pong is needed yet).
 
 ## High-Level Architecture (intended, mirrors ClothSim)
 
