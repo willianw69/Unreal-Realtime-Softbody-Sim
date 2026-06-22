@@ -37,7 +37,25 @@ struct FGPUConstraint
 	float  StiffScale = 1.0f;
 };
 
-/** Contiguous [Start, Count) span of one color within the sorted constraint buffer. */
+/**
+ * One per-tetrahedron volume constraint, as the GPU solver sees it (SB-M2).
+ * I0..I3 are the 4 particle indices; the solver preserves the tet's signed rest
+ * volume. StiffScale is a per-constraint relative stiffness multiplied by the global
+ * Stiffness * VolumeStiffness uniforms. Must match the HLSL `FVolumeConstraint` struct
+ * in SBSolveVolume.usf (24 bytes, tight scalar layout — structured buffers pack tightly,
+ * the 16-byte alignment trap is for constant buffers only).
+ */
+struct FGPUVolumeConstraint
+{
+	uint32 I0 = 0;
+	uint32 I1 = 0;
+	uint32 I2 = 0;
+	uint32 I3 = 0;
+	float  RestVolume = 0.0f;
+	float  StiffScale = 1.0f;
+};
+
+/** Contiguous [Start, Count) span of one color within a sorted constraint buffer. */
 struct FSoftBodyColorRange
 {
 	int32 Start = 0;
@@ -68,8 +86,9 @@ struct FSoftBodyParams
 
 	// XPBD/PBD solver controls.
 	int32   Substeps = 2;          // split DeltaTime for stability (biggest quality lever)
-	int32   SolverIterations = 8;  // distance-constraint relaxation passes per substep
-	float   Stiffness = 1.0f;      // [0,1] correction scale
+	int32   SolverIterations = 8;  // constraint relaxation passes per substep
+	float   Stiffness = 1.0f;      // [0,1] global distance-correction scale
+	float   VolumeStiffness = 1.0f;// [0,1] per-tet volume-correction scale (SB-M2)
 
 	// Collision — world-space colliders rebuilt each frame (SB-M4); empty for SB-M1.
 	TArray<FGPUCollider> Colliders;
@@ -105,6 +124,12 @@ struct FSoftBodyRenderResources
 	int32 NumConstraints = 0;
 	TArray<FSoftBodyColorRange> ColorRanges;
 
+	// Per-tet volume constraints + their own graph coloring (SB-M2). Second constraint
+	// set: same color-sorted, race-free per-color dispatch scheme as the distance edges.
+	TRefCountPtr<FRDGPooledBuffer> VolumeConstraintsBuffer;
+	int32 NumVolumeConstraints = 0;
+	TArray<FSoftBodyColorRange> VolumeColorRanges;
+
 	int32 NumParticles = 0;
 	bool  bInitialized = false;
 
@@ -129,7 +154,8 @@ struct FSoftBodyRenderResources
 namespace SoftBodyCompute
 {
 	/** One-time: create pooled buffers and upload the initial particle lattice + constraints.
-	 *  Constraints must already be sorted by color; ColorRanges indexes into them. */
+	 *  Distance and volume constraints must already be sorted by color; their ColorRanges
+	 *  index into them. */
 	void InitResources_RenderThread(
 		FRHICommandListImmediate& RHICmdList,
 		const TSharedPtr<FSoftBodyRenderResources>& Resources,
@@ -137,7 +163,9 @@ namespace SoftBodyCompute
 		const TArray<FVector3f>& InitialVelocities,
 		const TArray<float>& InitialInvMasses,
 		const TArray<FGPUConstraint>& Constraints,
-		const TArray<FSoftBodyColorRange>& ColorRanges);
+		const TArray<FSoftBodyColorRange>& ColorRanges,
+		const TArray<FGPUVolumeConstraint>& VolumeConstraints,
+		const TArray<FSoftBodyColorRange>& VolumeColorRanges);
 
 	/** Per-frame: run the substep pipeline and kick a position readback. */
 	void Dispatch_RenderThread(

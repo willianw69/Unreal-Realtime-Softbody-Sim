@@ -72,6 +72,35 @@ public:
 	}
 };
 
+// Graph-colored Gauss-Seidel per-tet volume solve: one thread per tetrahedron, one
+// dispatch per color, moving all 4 vertices in place to restore the rest volume (SB-M2).
+class FSBSolveVolumeCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBSolveVolumeCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBSolveVolumeCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUVolumeConstraint>, VolumeConstraints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, Positions)
+		SHADER_PARAMETER(uint32, ColorStart)
+		SHADER_PARAMETER(uint32, ColorCount)
+		SHADER_PARAMETER(float, Stiffness)
+		SHADER_PARAMETER(float, VolumeStiffness)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+	}
+};
+
 class FSBCollisionCS : public FGlobalShader
 {
 public:
@@ -130,6 +159,7 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FSBPredictCS,       "/SoftBodySim/Private/SBPredict.usf",       "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveDistanceCS, "/SoftBodySim/Private/SBSolveDistance.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBSolveVolumeCS,   "/SoftBodySim/Private/SBSolveVolume.usf",   "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionCS,     "/SoftBodySim/Private/SBCollision.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBFinalizeCS,      "/SoftBodySim/Private/SBFinalize.usf",      "MainCS", SF_Compute);
 
@@ -155,7 +185,9 @@ void SoftBodyCompute::InitResources_RenderThread(
 	const TArray<FVector3f>& InitialVelocities,
 	const TArray<float>& InitialInvMasses,
 	const TArray<FGPUConstraint>& Constraints,
-	const TArray<FSoftBodyColorRange>& ColorRanges)
+	const TArray<FSoftBodyColorRange>& ColorRanges,
+	const TArray<FGPUVolumeConstraint>& VolumeConstraints,
+	const TArray<FSoftBodyColorRange>& VolumeColorRanges)
 {
 	check(IsInRenderingThread());
 	check(Resources.IsValid());
@@ -195,6 +227,18 @@ void SoftBodyCompute::InitResources_RenderThread(
 			sizeof(FGPUConstraint), Constraints.Num(),
 			Constraints.GetData(), sizeof(FGPUConstraint) * Constraints.Num());
 		GraphBuilder.QueueBufferExtraction(ConstraintsBuf, &Resources->ConstraintsBuffer);
+	}
+
+	// Color-sorted per-tet volume constraint buffer (SB-M2).
+	Resources->NumVolumeConstraints = VolumeConstraints.Num();
+	Resources->VolumeColorRanges = VolumeColorRanges;
+	if (VolumeConstraints.Num() > 0)
+	{
+		FRDGBufferRef VolumeBuf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.VolumeConstraints"),
+			sizeof(FGPUVolumeConstraint), VolumeConstraints.Num(),
+			VolumeConstraints.GetData(), sizeof(FGPUVolumeConstraint) * VolumeConstraints.Num());
+		GraphBuilder.QueueBufferExtraction(VolumeBuf, &Resources->VolumeConstraintsBuffer);
 	}
 
 	GraphBuilder.Execute();
@@ -288,9 +332,22 @@ void SoftBodyCompute::Dispatch_RenderThread(
 		ConstraintsSRV = GraphBuilder.CreateSRV(ConstraintsBuf);
 	}
 
+	const bool bDoVolume = Resources->NumVolumeConstraints > 0
+		&& Resources->VolumeConstraintsBuffer.IsValid()
+		&& Resources->VolumeColorRanges.Num() > 0;
+
+	FRDGBufferSRVRef VolumeSRV = nullptr;
+	if (bDoVolume)
+	{
+		FRDGBufferRef VolumeBuf = GraphBuilder.RegisterExternalBuffer(
+			Resources->VolumeConstraintsBuffer, TEXT("SoftBody.VolumeConstraints"));
+		VolumeSRV = GraphBuilder.CreateSRV(VolumeBuf);
+	}
+
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 	TShaderMapRef<FSBPredictCS>       PredictCS(ShaderMap);
 	TShaderMapRef<FSBSolveDistanceCS> SolveCS(ShaderMap);
+	TShaderMapRef<FSBSolveVolumeCS>   VolumeCS(ShaderMap);
 	TShaderMapRef<FSBCollisionCS>     CollisionCS(ShaderMap);
 	TShaderMapRef<FSBFinalizeCS>      FinalizeCS(ShaderMap);
 
@@ -315,13 +372,15 @@ void SoftBodyCompute::Dispatch_RenderThread(
 					PredictCS, P, GroupCount);
 			}
 
-			// --- Solve: graph-colored Gauss-Seidel distance constraints, in place ---
+			// --- Solve: graph-colored Gauss-Seidel constraints, in place ---
 			// Within a color no two constraints share a particle (race-free UAV writes);
 			// each color reads the previous one's results (RDG serializes the UAV), giving
-			// true Gauss-Seidel propagation. No ping-pong needed.
-			if (bDoConstraints)
+			// true Gauss-Seidel propagation. No ping-pong needed. Each iteration relaxes the
+			// distance edges then the per-tet volume constraints, so they converge together.
+			const int32 SolveIters = (bDoConstraints || bDoVolume) ? Iterations : 0;
+			for (int32 Iter = 0; Iter < SolveIters; ++Iter)
 			{
-				for (int32 Iter = 0; Iter < Iterations; ++Iter)
+				if (bDoConstraints)
 				{
 					for (int32 Color = 0; Color < Resources->ColorRanges.Num(); ++Color)
 					{
@@ -342,6 +401,31 @@ void SoftBodyCompute::Dispatch_RenderThread(
 						FComputeShaderUtils::AddPass(GraphBuilder,
 							RDG_EVENT_NAME("SBSolveDistance (substep %d iter %d color %d)", Step, Iter, Color),
 							SolveCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
+					}
+				}
+
+				if (bDoVolume)
+				{
+					for (int32 Color = 0; Color < Resources->VolumeColorRanges.Num(); ++Color)
+					{
+						const FSoftBodyColorRange& Range = Resources->VolumeColorRanges[Color];
+						if (Range.Count <= 0)
+						{
+							continue;
+						}
+
+						FSBSolveVolumeCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveVolumeCS::FParameters>();
+						P->VolumeConstraints = VolumeSRV;
+						P->InvMasses         = InvMassesSRV;
+						P->Positions         = GraphBuilder.CreateUAV(Predicted);
+						P->ColorStart        = (uint32)Range.Start;
+						P->ColorCount        = (uint32)Range.Count;
+						P->Stiffness         = Params.Stiffness;
+						P->VolumeStiffness   = Params.VolumeStiffness;
+
+						FComputeShaderUtils::AddPass(GraphBuilder,
+							RDG_EVENT_NAME("SBSolveVolume (substep %d iter %d color %d)", Step, Iter, Color),
+							VolumeCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
 					}
 				}
 			}

@@ -98,9 +98,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "1", ClampMax = "64"))
 	int32 SolverIterations = 8;
 
-	/** Correction strength [0..1]. 1 = try to fully satisfy constraints each iteration. */
+	/** Distance-constraint correction strength [0..1]. 1 = try to fully satisfy each iteration. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Stiffness = 1.0f;
+
+	/**
+	 * Per-tet VOLUME-constraint correction strength [0..1] (SB-M2). Higher = firmer
+	 * volume preservation (more "jelly", resists squashing); 0 = distance-only (SB-M1
+	 * behaviour, can flatten). The headline soft body lever.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float VolumeStiffness = 1.0f;
 
 	/**
 	 * Fixed simulation timestep (seconds). The sim always advances in chunks of this
@@ -155,6 +163,11 @@ private:
 	 *  them, producing a color-sorted buffer + per-color ranges. */
 	void BuildConstraints(TArray<FGPUConstraint>& OutConstraints, TArray<FSoftBodyColorRange>& OutColorRanges) const;
 
+	/** Build one volume constraint per tet (signed rest volume from the rest lattice) and
+	 *  greedily graph-color the tets (two tets conflict if they share ANY of their 4
+	 *  vertices), producing a color-sorted buffer + per-color ranges (SB-M2). */
+	void BuildVolumeConstraints(TArray<FGPUVolumeConstraint>& OutConstraints, TArray<FSoftBodyColorRange>& OutColorRanges) const;
+
 	/** Compute smooth per-vertex normals + arbitrary tangents from the boundary surface (local space). */
 	void ComputeSurfaceNormalsTangents(
 		const TArray<FVector3f>& InPositions,
@@ -196,6 +209,8 @@ private:
 	// Stats captured at BeginPlay for the on-screen readout.
 	int32 NumConstraintsBuilt = 0;
 	int32 NumColorsBuilt = 0;
+	int32 NumVolumeConstraintsBuilt = 0;
+	int32 NumVolumeColorsBuilt = 0;
 
 	FBoxSphereBounds LocalBounds = FBoxSphereBounds(ForceInit);
 

@@ -71,4 +71,29 @@ forward-declared element type compiled fine in isolation but broke in the UHT-ge
 destructor (incomplete-type, C2672) — a concrete lesson in how Unreal's code generation changes the
 rules around incomplete types vs. a hand-written class.
 
-<!-- Append SB-M2, SB-M3, … sections below as milestones are completed. -->
+## SB-M2 — Volume constraints → jelly ✅ 2026-06-22
+**Shipped:** The defining soft body feature — GPU **per-tetrahedron volume preservation**. A box now
+squashes on impact and bulges back to its rest volume instead of collapsing, matching the look of
+commercial tools (Unity Obi Softbody / Zibra). Implemented as a *second* graph-colored constraint set
+layered onto SB-M1's distance solver with no new topology — proof that the colored-Gauss-Seidel
+framework generalizes across constraint types.
+
+**Talking points proven in M2:**
+- **PBD volume constraint on the GPU, from the math up:** signed tet volume `V=(1/6)dot(e1,e2×e3)`,
+  constraint `C=V−V0`, analytic per-vertex gradients (cross products of opposing edges), mass-weighted
+  scaling `s=−C/Σw|g|²`. One compute thread per tet, all 4 vertices corrected in place.
+- **Graph coloring generalized to 4-vertex constraints:** tets are greedily colored so no two tets in a
+  color share *any* vertex — the same race-free, in-place, per-color dispatch idea as the distance edges,
+  but proving the scheme isn't specific to 2-endpoint constraints. Two independent constraint sets
+  (edges + tets), each with its own colors, interleaved per solver iteration so they co-converge.
+- **One tunable that tells the whole story:** `VolumeStiffness` 0→1 sweeps from distance-only (flattens)
+  to volume-preserving (jelly) — a clean A/B demo of exactly what the volume term contributes.
+- **Architecture payoff:** because SB-M1 already built the tetrahedra, M2 was "add a shader + a buffer +
+  a coloring pass" with zero changes to the lattice, surface, readback, or render path. Compiled and
+  worked first try.
+
+**Resume bullet candidate:** "Implemented GPU volume-preserving soft bodies via per-tetrahedron Position
+Based Dynamics volume constraints, graph-colored for race-free parallel solving, layered onto a shared
+colored-Gauss-Seidel framework also driving a cloth simulator."
+
+<!-- Append SB-M3, SB-M4, … sections below as milestones are completed. -->

@@ -70,4 +70,40 @@ the existing `Tets`, for true volume-preserving jelly.
 
 ---
 
-<!-- Append SB-M2, SB-M3, … entries below after each milestone is implemented + verified in-editor. -->
+## 2026-06-22 — SB-M2: volume constraints → jelly
+**What:** Added the headline feature — per-tetrahedron **volume constraints** as a second
+graph-colored constraint set, on top of SB-M1's distance edges. New shader `SBSolveVolume.usf`
+(+ `FSBSolveVolumeCS`); new `FGPUVolumeConstraint` struct (24-byte tight layout: 4 uint indices +
+rest volume + stiff scale) and a second pooled `VolumeConstraintsBuffer` / `NumVolumeConstraints` /
+`VolumeColorRanges` on `FSoftBodyRenderResources`; a `VolumeStiffness` [0..1] param + `UPROPERTY`.
+`USoftBodyComponent::BuildVolumeConstraints` computes each tet's signed rest volume
+`V0 = (1/6)·dot(e1, e2×e3)` from the rest lattice and **greedily colors the tets** (two tets conflict
+if they share ANY of their 4 vertices — the 4-wide analogue of the edge coloring). The dispatch now
+interleaves, per iteration: all distance colors, then all volume colors, solving both in place on the
+single `Predicted` buffer.
+
+The solve itself (PBD volume constraint, Müller et al.): `C = V − V0`; per-vertex gradients
+`g1=(1/6)e2×e3, g2=(1/6)e3×e1, g3=(1/6)e1×e2, g0=−(g1+g2+g3)`; scale `s = −C / Σ w_k|g_k|²`;
+correction `dp_k = K·s·w_k·g_k` with `K = saturate(Stiffness·VolumeStiffness·StiffScale)`. Pinned
+verts (w=0) contribute nothing; color guarantees the 4 writes per thread are disjoint → race-free.
+
+**Why:** Volume preservation is the defining "solid jelly" behaviour (Obi/Zibra-style) and the
+whole reason for choosing a tetrahedral model over cloth-style distance-only or pressure/shape-matching.
+SB-M1 deliberately pre-built the `Tets`, so this milestone was purely "add a second constraint set" —
+no new topology, validating that the colored-Gauss-Seidel framework generalizes across constraint types.
+
+**Problems & solutions:** None — compiled + linked first try. The structured-buffer stride gotcha was
+pre-empted by using a tight scalar struct (24 B) that matches between C++ and HLSL (structured buffers
+pack tightly; the 16-byte-alignment trap is constant-buffer-only). A/B verified in-editor: VolumeStiffness
+0 reproduces SB-M1 flattening, 1 holds volume and bulges back.
+
+**Performance:** Not yet profiled. Default 5×5×5 = 384 tets in a handful of colors; solve dispatches per
+substep = `iters × (distanceColors + volumeColors)` (shown in the on-screen stats). Volume roughly
+doubles the per-iteration dispatch count vs SB-M1.
+
+**Next:** SB-M3 — mouse dragging: deproject cursor → ray, pick nearest boundary particle from the
+readback, push a grab target to the render thread, pull that particle (soft attachment / temp pin).
+
+---
+
+<!-- Append SB-M3, SB-M4, … entries below after each milestone is implemented + verified in-editor. -->

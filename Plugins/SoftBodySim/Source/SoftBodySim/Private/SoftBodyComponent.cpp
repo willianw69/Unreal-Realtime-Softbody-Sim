@@ -289,6 +289,111 @@ void USoftBodyComponent::BuildConstraints(
 	}
 }
 
+void USoftBodyComponent::BuildVolumeConstraints(
+	TArray<FGPUVolumeConstraint>& OutConstraints,
+	TArray<FSoftBodyColorRange>& OutColorRanges) const
+{
+	OutConstraints.Reset();
+	OutColorRanges.Reset();
+	if (Tets.Num() == 0)
+	{
+		return;
+	}
+
+	// --- 1. One volume constraint per tet, with its signed rest volume ------
+	// V0 = (1/6) dot(e1, e2 x e3) from the rest lattice (e_k = p_k - p_0). The sign is
+	// consistent across tets (same vertex ordering from BuildTets), so C = V - V0 is well
+	// defined regardless of the absolute sign.
+	TArray<FGPUVolumeConstraint> Vols;
+	Vols.Reserve(Tets.Num());
+	for (const FSoftBodyTet& T : Tets)
+	{
+		const FVector3f& P0 = InitialLocalPositions[T.V0];
+		const FVector3f& P1 = InitialLocalPositions[T.V1];
+		const FVector3f& P2 = InitialLocalPositions[T.V2];
+		const FVector3f& P3 = InitialLocalPositions[T.V3];
+		const FVector3f E1 = P1 - P0;
+		const FVector3f E2 = P2 - P0;
+		const FVector3f E3 = P3 - P0;
+		const float RestVol = (1.0f / 6.0f) * FVector3f::DotProduct(E1, FVector3f::CrossProduct(E2, E3));
+
+		Vols.Add(FGPUVolumeConstraint{ T.V0, T.V1, T.V2, T.V3, RestVol, 1.0f });
+	}
+
+	// --- 2. Greedy graph coloring -------------------------------------------
+	// Two tets conflict if they share ANY of their 4 vertices. Assign each tet the
+	// smallest color free on all 4 endpoints, so within a color the (4-wide) writes are
+	// disjoint -> race-free per-color GPU dispatch.
+	TArray<int32> TetColor;
+	TetColor.SetNumUninitialized(Vols.Num());
+
+	TArray<TSet<int32>> UsedColorsAt;
+	UsedColorsAt.SetNum(NumParticles);
+
+	int32 NumColors = 0;
+	for (int32 t = 0; t < Vols.Num(); ++t)
+	{
+		const FGPUVolumeConstraint& V = Vols[t];
+		const uint32 Idx[4] = { V.I0, V.I1, V.I2, V.I3 };
+
+		int32 Color = 0;
+		for (;;)
+		{
+			bool bClash = false;
+			for (int32 k = 0; k < 4; ++k)
+			{
+				if (UsedColorsAt[Idx[k]].Contains(Color))
+				{
+					bClash = true;
+					break;
+				}
+			}
+			if (!bClash)
+			{
+				break;
+			}
+			++Color;
+		}
+
+		TetColor[t] = Color;
+		for (int32 k = 0; k < 4; ++k)
+		{
+			UsedColorsAt[Idx[k]].Add(Color);
+		}
+		NumColors = FMath::Max(NumColors, Color + 1);
+	}
+
+	// --- 3. Bucket tets into a color-sorted buffer + ranges -----------------
+	TArray<int32> CountPerColor;
+	CountPerColor.Init(0, NumColors);
+	for (int32 t = 0; t < Vols.Num(); ++t)
+	{
+		++CountPerColor[TetColor[t]];
+	}
+
+	OutColorRanges.SetNum(NumColors);
+	int32 Running = 0;
+	for (int32 c = 0; c < NumColors; ++c)
+	{
+		OutColorRanges[c].Start = Running;
+		OutColorRanges[c].Count = CountPerColor[c];
+		Running += CountPerColor[c];
+	}
+
+	OutConstraints.SetNumUninitialized(Vols.Num());
+	TArray<int32> Cursor;
+	Cursor.SetNumUninitialized(NumColors);
+	for (int32 c = 0; c < NumColors; ++c)
+	{
+		Cursor[c] = OutColorRanges[c].Start;
+	}
+	for (int32 t = 0; t < Vols.Num(); ++t)
+	{
+		const int32 c = TetColor[t];
+		OutConstraints[Cursor[c]++] = Vols[t];
+	}
+}
+
 void USoftBodyComponent::InitializeSimulation()
 {
 	ResX = FMath::Clamp(ResX, 2, 32);
@@ -351,15 +456,24 @@ void USoftBodyComponent::InitializeSimulation()
 	NumConstraintsBuilt = Constraints.Num();
 	NumColorsBuilt      = ColorRanges.Num();
 
+	// Per-tet volume constraints + their own graph coloring (SB-M2).
+	TArray<FGPUVolumeConstraint> VolumeConstraints;
+	TArray<FSoftBodyColorRange>  VolumeColorRanges;
+	BuildVolumeConstraints(VolumeConstraints, VolumeColorRanges);
+	NumVolumeConstraintsBuilt = VolumeConstraints.Num();
+	NumVolumeColorsBuilt      = VolumeColorRanges.Num();
+
 	RenderResources = MakeShared<FSoftBodyRenderResources>();
 
 	TSharedPtr<FSoftBodyRenderResources> Resources = RenderResources;
 	ENQUEUE_RENDER_COMMAND(SoftBodySimInit)(
 		[Resources, Positions = MoveTemp(Positions), Velocities = MoveTemp(Velocities), InvMasses = MoveTemp(InvMasses),
-		 Constraints = MoveTemp(Constraints), ColorRanges = MoveTemp(ColorRanges)]
+		 Constraints = MoveTemp(Constraints), ColorRanges = MoveTemp(ColorRanges),
+		 VolumeConstraints = MoveTemp(VolumeConstraints), VolumeColorRanges = MoveTemp(VolumeColorRanges)]
 		(FRHICommandListImmediate& RHICmdList)
 		{
-			SoftBodyCompute::InitResources_RenderThread(RHICmdList, Resources, Positions, Velocities, InvMasses, Constraints, ColorRanges);
+			SoftBodyCompute::InitResources_RenderThread(RHICmdList, Resources, Positions, Velocities, InvMasses,
+				Constraints, ColorRanges, VolumeConstraints, VolumeColorRanges);
 		});
 }
 
@@ -436,6 +550,7 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	Params.Substeps         = Substeps;
 	Params.SolverIterations = SolverIterations;
 	Params.Stiffness        = Stiffness;
+	Params.VolumeStiffness  = VolumeStiffness;
 	Params.Friction         = Friction;
 	Params.bGroundPlane     = bGroundPlane;
 	Params.GroundZ          = GroundHeight;
@@ -472,10 +587,13 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 			FString::Printf(TEXT("SoftBody  lattice=%dx%dx%d  particles=%d  tets=%d"),
 				ResX, ResY, ResZ, NumParticles, Tets.Num()));
 
+		// Total solve dispatches per substep = iters * (distance colors + volume colors).
+		const int32 SolveDispatches = SolverIterations * (NumColorsBuilt + NumVolumeColorsBuilt);
 		GEngine->AddOnScreenDebugMessage(
 			(uint64)(UPTRINT)this + 2, 0.0f, FColor::Cyan,
-			FString::Printf(TEXT("  constraints=%d  colors=%d  substeps=%d  iters=%d  solve dispatches/substep=%d"),
-				NumConstraintsBuilt, NumColorsBuilt, Substeps, SolverIterations, SolverIterations * NumColorsBuilt));
+			FString::Printf(TEXT("  dist: constraints=%d colors=%d  |  vol: tets=%d colors=%d  |  substeps=%d iters=%d  dispatches/substep=%d"),
+				NumConstraintsBuilt, NumColorsBuilt, NumVolumeConstraintsBuilt, NumVolumeColorsBuilt,
+				Substeps, SolverIterations, SolveDispatches));
 	}
 }
 

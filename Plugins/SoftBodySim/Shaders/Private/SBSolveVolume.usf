@@ -1,0 +1,110 @@
+// SBSolveVolume.usf
+//
+// The headline soft body constraint (SB-M2): one color of a graph-colored
+// Gauss-Seidel PER-TETRAHEDRON VOLUME solve. This is what turns a springy
+// distance-only lattice into volume-preserving "jelly".
+//
+// PARALLELISM STRATEGY (same as the distance solve, but 4 particles per thread):
+//   One thread per TETRAHEDRON. The volume-constraint buffer is sorted by color, and
+//   the CPU colored the tets so that no two tets in the same color share ANY of their
+//   4 vertices. The caller dispatches ONE color at a time, so every thread writes 4
+//   DISJOINT particle slots -> the position buffer is a read-write UAV with no atomics
+//   and no data races. Each color reads the previous color's writes (RDG serializes
+//   the UAV), giving true Gauss-Seidel propagation.
+//
+// MATH (Position Based Dynamics volume constraint, Müller et al.):
+//   Signed volume   V  = (1/6) * dot(e1, cross(e2, e3)),  e_k = p_k - p_0
+//   Constraint      C  = V - V0
+//   Gradients       g1 = (1/6) cross(e2, e3)
+//                   g2 = (1/6) cross(e3, e1)
+//                   g3 = (1/6) cross(e1, e2)
+//                   g0 = -(g1 + g2 + g3)
+//   Scaling factor  s  = -C / sum_k( w_k * |g_k|^2 )
+//   Correction      dp_k = K * s * w_k * g_k        (K = stiffness, mass-weighted split)
+// Pinned vertices (w == 0) contribute nothing and don't move.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+// Must match FGPUVolumeConstraint in SoftBodyResources.h (24 bytes, tight layout).
+struct FVolumeConstraint
+{
+	uint	I0;
+	uint	I1;
+	uint	I2;
+	uint	I3;
+	float	RestVolume;
+	float	StiffScale;
+};
+
+StructuredBuffer<FVolumeConstraint>	VolumeConstraints;
+StructuredBuffer<float>				InvMasses;
+RWStructuredBuffer<float3>			Positions;	// in/out (predicted positions, solved in place)
+
+uint	ColorStart;			// first constraint index of this color
+uint	ColorCount;			// number of constraints in this color
+float	Stiffness;			// [0,1] global correction scale
+float	VolumeStiffness;	// [0,1] volume-specific correction scale
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Local = DispatchThreadId.x;
+	if (Local >= ColorCount)
+	{
+		return;
+	}
+
+	const FVolumeConstraint C = VolumeConstraints[ColorStart + Local];
+
+	const float w0 = InvMasses[C.I0];
+	const float w1 = InvMasses[C.I1];
+	const float w2 = InvMasses[C.I2];
+	const float w3 = InvMasses[C.I3];
+	if (w0 + w1 + w2 + w3 <= 1e-8f)
+	{
+		return; // all four vertices pinned
+	}
+
+	const float3 P0 = Positions[C.I0];
+	const float3 P1 = Positions[C.I1];
+	const float3 P2 = Positions[C.I2];
+	const float3 P3 = Positions[C.I3];
+
+	const float3 E1 = P1 - P0;
+	const float3 E2 = P2 - P0;
+	const float3 E3 = P3 - P0;
+
+	const float Vol = (1.0f / 6.0f) * dot(E1, cross(E2, E3));
+	const float Cerr = Vol - C.RestVolume;
+
+	// Per-vertex gradients (cross products of opposing edges, scaled by 1/6).
+	const float3 G1 = (1.0f / 6.0f) * cross(E2, E3);
+	const float3 G2 = (1.0f / 6.0f) * cross(E3, E1);
+	const float3 G3 = (1.0f / 6.0f) * cross(E1, E2);
+	const float3 G0 = -(G1 + G2 + G3);
+
+	const float Denom =
+		w0 * dot(G0, G0) +
+		w1 * dot(G1, G1) +
+		w2 * dot(G2, G2) +
+		w3 * dot(G3, G3);
+	if (Denom <= 1e-12f)
+	{
+		return; // degenerate / sliver tet — no well-defined correction this pass
+	}
+
+	const float K = saturate(Stiffness * VolumeStiffness * C.StiffScale);
+	const float S = -Cerr / Denom;
+
+	// Mass-weighted correction. w_k == 0 (pinned) naturally yields zero displacement.
+	// Color guarantees these 4 slots are disjoint across the dispatch, so the writes
+	// are race-free.
+	Positions[C.I0] = P0 + (K * S * w0) * G0;
+	Positions[C.I1] = P1 + (K * S * w1) * G1;
+	Positions[C.I2] = P2 + (K * S * w2) * G2;
+	Positions[C.I3] = P3 + (K * S * w3) * G3;
+}

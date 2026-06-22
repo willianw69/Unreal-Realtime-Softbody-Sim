@@ -1,13 +1,13 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-22 (SB-M1 complete + verified in-editor).
+> Last updated: 2026-06-22 (SB-M2 complete + verified in-editor).
 
 | Milestone | Title | Status |
 |---|---|---|
 | M0 | Project bootstrap (C++ host builds) | ✅ |
 | SB-M1 | GPU lattice solid (framework port + distance constraints) | ✅ |
-| SB-M2 | Volume constraints → jelly (tetrahedra) | ⏳ |
+| SB-M2 | Volume constraints → jelly (tetrahedra) | ✅ |
 | SB-M3 | Mouse dragging (pick + grab constraint) | ⏳ |
 | SB-M4 | Collisions (ground / sphere / self) | ⏳ |
 | SB-M+ | XPBD compliance, Sphere/SDF shapes, mesh embedding, profiling | ⏳ (stretch) |
@@ -30,12 +30,15 @@ jiggles/sags, and rests on the floor (volume not yet preserved — expected). Th
 Note: tetrahedra are already built here (not deferred to SB-M2) because the distance constraints derive
 from tet edges — so SB-M2 only needs to add a second (volume) constraint set over the existing `Tets`.
 
-### SB-M2 — Volume constraints → jelly ⏳ (do this next)
-Add per-tet **volume constraints** (`SBSolveVolume.usf`) over the **already-built** `Tets` array
-(6-tet Kuhn split, computed in SB-M1), graph-colored as a **second** constraint set with its own
-color ranges and per-color dispatches. Rest volume `V0 = (1/6)·dot(e1, e2×e3)`; PBD `C = V − V0`,
-gradients = cross products of opposing edges, move all 4 verts mass-weighted. Volume preserved → jelly.
-The headline feature. Tune distance-vs-volume relative stiffness + iterations.
+### SB-M2 — Volume constraints → jelly ✅ (verified in-editor 2026-06-22)
+Added per-tet **volume constraints** (`SBSolveVolume.usf`) over the `Tets` array built in SB-M1,
+graph-colored as a **second** constraint set (its own color ranges + per-color dispatches; two tets
+conflict if they share any of their 4 vertices). Rest volume `V0 = (1/6)·dot(e1, e2×e3)`; PBD
+`C = V − V0`, gradients = cross products of opposing edges, all 4 verts moved mass-weighted, race-free
+per color. Each solver iteration relaxes distance colors then volume colors so they converge together.
+Exposed a `VolumeStiffness` [0..1] knob. **Result:** the box keeps its volume — squashes and bulges
+back like jelly. The A/B test (VolumeStiffness 0 = SB-M1 flatten, 1 = volume-preserving) is the
+headline demo. The defining "Obi/Zibra-style" behaviour is now in.
 
 ### SB-M3 — Mouse dragging ⏳
 Deproject cursor → ray; pick nearest boundary particle (CPU from readback); push grab target; grab

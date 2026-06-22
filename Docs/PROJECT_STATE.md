@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 > Single source of truth for current project status. Update after every milestone.
-> Last updated: 2026-06-22 (SB-M1 complete + verified in-editor; SB-M2 is next).
+> Last updated: 2026-06-22 (SB-M2 complete + verified in-editor; SB-M3 is next).
 
 ## Project Overview
 Real-time **GPU soft body simulation built from scratch** in **Unreal Engine 5.7**, as a
@@ -24,9 +24,10 @@ constraints** · **mouse dragging** · **volume preservation (jelly)** · UE 5.7
 similar to Obi/Zibra soft body.
 
 ## Current Milestone
-**SB-M1 — GPU lattice solid: COMPLETE + verified in-editor (2026-06-22).** The `SoftBodySim` plugin
-exists and runs: a box lattice falls under gravity, jiggles/sags via GPU distance constraints, and
-rests on the built-in ground plane. Rendered as a lit two-sided mesh. Volume not yet preserved (SB-M2).
+**SB-M2 — Volume constraints → jelly: COMPLETE + verified in-editor (2026-06-22).** Per-tet volume
+constraints now run as a second graph-colored constraint set, so the box preserves its volume —
+squashes and bulges back like jelly (the defining Obi/Zibra-style behaviour). A `VolumeStiffness`
+knob drives the effect (0 = SB-M1 flatten, 1 = volume-preserving). The headline feature is in.
 
 ## Completed Milestones
 - **M0 — Bootstrap.** UE 5.7 C++ host project `SoftBodyDemo` (BuildSettings V6, DX12,
@@ -38,12 +39,17 @@ rests on the built-in ground plane. Rendered as a lit two-sided mesh. Volume not
   lattice, the 6-tet Kuhn split per cell, deduped distance constraints from tet edges + greedy graph
   coloring, and the boundary surface; pipeline Predict → colored Gauss-Seidel → ground collision →
   Finalize → readback → lit mesh. Built-in ground plane + face anchor option. Verified in-editor.
+- **SB-M2 — Volume constraints → jelly.** Added `SBSolveVolume.usf` + `FSBSolveVolumeCS` and a second
+  pooled `VolumeConstraintsBuffer`. The component builds one volume constraint per tet (signed rest
+  volume) and greedily colors the tets (conflict = shared vertex). The substep solve interleaves
+  distance colors then volume colors each iteration. `VolumeStiffness` param + `FGPUVolumeConstraint`
+  struct. Volume-preserving jelly verified in-editor.
 
 ## Next Milestone
-**SB-M2 — Volume constraints → jelly.** Add per-tet **volume constraints** (`SBSolveVolume.usf`) over
-the `Tets` array already built in SB-M1, graph-colored as a **second** constraint set (own color ranges
-+ per-color dispatches). Rest volume `V0=(1/6)·dot(e1,e2×e3)`; PBD `C=V−V0`, gradients = cross of
-opposing edges, all 4 verts moved mass-weighted. Volume preserved → jelly. See `ROADMAP.md`/`HANDOFF.md`.
+**SB-M3 — Mouse dragging.** Deproject the cursor to a world ray; pick the nearest **boundary** particle
+(CPU, from the position readback) and remember its index + grab depth; each frame push
+`{grabbedIndex, targetWorldPos}` to the render thread and pull that particle toward the target (soft
+attachment / temporary pin). Reuses the existing readback + param-push pattern. See `ROADMAP.md`/`HANDOFF.md`.
 
 ## Technical Decisions
 - **Method:** tetrahedral XPBD — a particle lattice filled with tetrahedra; solve **distance**
@@ -61,8 +67,9 @@ opposing edges, all 4 verts moved mass-weighted. Volume preserved → jelly. See
   `SoftBodySim` plugin (~70–80% transfers). See `ARCHITECTURE.md` for the reuse map.
 
 ## Known Limitations / Notes (planned)
-- Until SB-M2 (volume constraints) the body holds shape only via distance constraints → it can
-  collapse/lose volume.
+- Volume preservation is PBD (iteration-dependent stiffness), not XPBD compliance — very high
+  `VolumeStiffness` + low Substeps can jitter; the fix is more Substeps (or XPBD λ, a stretch goal).
+- No mouse interaction yet (SB-M3); collisions are ground-plane only so far (sphere/capsule + self in SB-M4).
 - Point-based collisions (SB-M4) reuse cloth and are not continuous (no CCD).
 - Surface rendering is the lattice boundary; embedding a smooth render mesh skinned to tets is a
   later upgrade.
