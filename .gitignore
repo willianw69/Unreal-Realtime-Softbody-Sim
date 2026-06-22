@@ -1,0 +1,38 @@
+# Unreal Engine generated folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+Platforms/*/Binaries/
+Platforms/*/Intermediate/
+
+# Plugin build artifacts
+Plugins/**/Binaries/
+Plugins/**/Intermediate/
+
+# IDE / project files
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.xcodeproj/
+*.xcworkspace/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+
+# OS junk
+Desktop.ini
+.DS_Store
+Thumbs.db
+
+# Crash dumps / logs
+*.log
+*.pdb
+
+# Keep these tracked explicitly:
+#   *.uproject, Config/, Source/, Plugins/**/Source/, Plugins/**/Shaders/,
+#   Plugins/**/*.uplugin, Content/ (if any), Docs/

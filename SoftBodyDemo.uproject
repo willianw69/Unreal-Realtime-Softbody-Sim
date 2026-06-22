@@ -1,0 +1,13 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.7",
+	"Category": "",
+	"Description": "Real-time GPU soft body simulation from scratch (XPBD on compute shaders).",
+	"Modules": [
+		{
+			"Name": "SoftBodyDemo",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

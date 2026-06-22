@@ -1,0 +1,20 @@
+# Normalize line endings for text; let git handle working-tree conversion.
+* text=auto
+
+# Source/text types
+*.cpp   text
+*.h     text
+*.cs    text
+*.usf   text
+*.ush   text
+*.ini   text
+*.md    text
+*.uproject text
+*.uplugin  text
+
+# Unreal binary asset types — never diff/normalize.
+*.umap  binary
+*.uasset binary
+*.png   binary
+*.tga   binary
+*.fbx   binary
