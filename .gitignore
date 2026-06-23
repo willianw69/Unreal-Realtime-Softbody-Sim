@@ -36,3 +36,10 @@ Thumbs.db
 # Keep these tracked explicitly:
 #   *.uproject, Config/, Source/, Plugins/**/Source/, Plugins/**/Shaders/,
 #   Plugins/**/*.uplugin, Content/ (if any), Docs/
+
+# Large / third-party demo assets — intentionally NOT committed (repo size, no LFS,
+# AI-generated provenance). The committed LV_Demo uses the box soft body; assign any
+# Static Mesh to SoftBody->SourceMesh to reproduce mesh embedding. See HANDOFF "DEMO ASSET NOTE".
+/Content/tripo_convert_*.uasset
+/Content/tripo_mat_*.uasset
+/Content/cute_bunny_3d_model_*.uasset
