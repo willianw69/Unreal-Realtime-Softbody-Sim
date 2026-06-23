@@ -117,4 +117,27 @@ volume preservation *tangible* in a demo.
 **Engineering note:** linker surfaced that `EKeys` lives in `InputCore` — the plugin needed that module
 dependency even though the host game module already had it (plugin and host link independently).
 
-<!-- Append SB-M4, SB-M5, … sections below as milestones are completed. -->
+## SB-M4 — Collisions (sphere/capsule + self) ✅ 2026-06-23
+**Shipped:** The jelly now collides with authored sphere/capsule shapes (drapes and squashes over them)
+and with itself (compressed regions don't interpenetrate). Completes the Obi/Zibra-style core feature set.
+
+**Talking points proven in M4:**
+- **GPU spatial-hash self-collision:** a Teschner-style hash grid built with atomics (`InterlockedAdd`)
+  for the broadphase, then a race-free Jacobi gather over the 27 neighbour cells for the response — the
+  one place atomics are used, deliberately confined to the build. Ported from the cloth simulator with a
+  single topology change (2D grid 1-ring → 3D lattice 1-ring exclusion), reusing the prime-sized table and
+  `MAX_PER_CELL` bucketing.
+- **Analytic colliders for free from the shared shader:** sphere and capsule are one routine (a sphere is
+  a degenerate capsule, A==B), so authored colliders lit up with zero shader changes — just Details-panel
+  UI + a per-frame world-space transform. Shows the value of designing the collision primitive generically.
+- **Buffer/dependency management under RDG:** self-collision needs a clean read snapshot, so the solve's
+  in-place buffer was split into an A/B ping-pong with a `Solved` ref threaded through the substep
+  (self-collision → grab → collision → finalize), letting RDG schedule correct read/write barriers.
+- **Ordering as design:** self-collision runs before the mouse grab and the ground/shape collision so a
+  hard pin or a solid surface always gets the final say on a particle's position that substep.
+
+**End-to-end story:** with M1–M4 the project delivers every stated requirement — fully GPU-simulated, no
+Chaos, runtime-generated constraints, volume-preserving jelly, mouse-draggable — plus ground/shape/self
+collision, all on a from-scratch compute + RDG framework shared with a sibling cloth simulator.
+
+<!-- Append SB-M+ / further sections below as work is completed. -->

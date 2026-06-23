@@ -13,6 +13,39 @@ struct FSoftBodyColorRange;
 class FSoftBodyMeshSceneProxy;
 class UMaterialInterface;
 
+/** Analytic collider shape authored in the Details panel (SB-M4). */
+UENUM(BlueprintType)
+enum class ESoftBodyColliderType : uint8
+{
+	Sphere,
+	Capsule
+};
+
+/** A single collider authored in the Details panel (transform relative to the component). */
+USTRUCT(BlueprintType)
+struct FSoftBodyCollider
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collider")
+	ESoftBodyColliderType Type = ESoftBodyColliderType::Sphere;
+
+	/** Center offset from the component origin (local space). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collider")
+	FVector Center = FVector(0.0f, 0.0f, -60.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collider", meta = (ClampMin = "0.1"))
+	float Radius = 40.0f;
+
+	/** Capsule only: half the distance between the two end caps, along the local axis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collider", meta = (ClampMin = "0.0"))
+	float HalfHeight = 50.0f;
+
+	/** Capsule only: orientation of the capsule axis (local up = capsule length). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collider")
+	FRotator Rotation = FRotator::ZeroRotator;
+};
+
 /** Which face of the lattice (if any) to anchor in place. */
 UENUM(BlueprintType)
 enum class ESoftBodyAnchor : uint8
@@ -86,9 +119,40 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (EditCondition = "bGroundPlane"))
 	float GroundHeight = 0.0f;
 
-	/** Contact friction [0..1]: how strongly the body grips the ground. */
+	/** Contact friction [0..1]: how strongly the body grips the ground / colliders. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Friction = 0.3f;
+
+	/** Sphere/capsule colliders the body collides against (transforms relative to this component). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")
+	TArray<FSoftBodyCollider> Colliders;
+
+	/** Draw wireframe shapes for the colliders (they are otherwise invisible math). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")
+	bool bDrawColliders = true;
+
+	/**
+	 * Body-vs-itself collision via a GPU spatial hash grid (SB-M4). Stops folded/compressed
+	 * regions from interpenetrating. Costs a broadphase build + a neighbour-scan pass per substep.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")
+	bool bSelfCollision = false;
+
+	/**
+	 * Self-collision thickness as a fraction of Spacing. Min separation kept between
+	 * non-adjacent particles = SelfCollisionScale * Spacing. Stays below 2*Spacing (the
+	 * nearest non-1-ring rest distance) so it doesn't fight the solver at rest.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.1", ClampMax = "1.9"))
+	float SelfCollisionScale = 1.0f;
+
+	/** Self-collision repulsion strength [0..1]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float SelfCollisionStiffness = 1.0f;
+
+	/** Self-collision repulsion passes per substep. More = firmer separation in deep compression, more cost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 SelfCollisionIterations = 2;
 
 	/** Substeps per frame. The biggest stability lever: more = stiffer, more stable. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "1", ClampMax = "16"))
@@ -201,6 +265,9 @@ private:
 
 	/** Draw readback positions as debug points (optional). */
 	void DrawDebug();
+
+	/** Draw wireframe shapes for the authored colliders so they're visible (SB-M4). */
+	void DrawColliders();
 
 	/** Flat lattice index for (x, y, z). */
 	FORCEINLINE int32 LatticeIndex(int32 X, int32 Y, int32 Z) const

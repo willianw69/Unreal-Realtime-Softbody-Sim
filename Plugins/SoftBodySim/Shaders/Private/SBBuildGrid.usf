@@ -1,0 +1,62 @@
+// SBBuildGrid.usf
+//
+// Self-collision broadphase BUILD pass (SB-M4). One thread per particle.
+//
+// Bins every particle into a uniform spatial hash grid so the self-collision pass only
+// has to look at the 27 neighbouring cells instead of all N particles. The grid is a
+// hash table of TableSize buckets; each bucket stores up to MAX_PER_CELL particle
+// indices. A particle computes its cell, hashes it to a bucket, claims the next free
+// slot with InterlockedAdd, and writes its index there.
+//
+// ATOMICS: this is the one place the soft body uses atomics (InterlockedAdd) — confined
+// to the broadphase build. The collision RESPONSE (SBSelfCollision.usf) stays a race-free
+// Jacobi gather. Buckets that overflow MAX_PER_CELL silently drop the extra indices
+// (a documented approximation: a few candidate pairs are missed in dense piles).
+//
+// Ported verbatim from ClothBuildGrid.usf (topology-agnostic).
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+#ifndef MAX_PER_CELL
+#define MAX_PER_CELL 16
+#endif
+
+StructuredBuffer<float3>	PredictedIn;	// positions to bin (solved, world space)
+RWBuffer<uint>				CellCounts;		// [TableSize] particles per bucket (cleared to 0; typed for ClearUAV + atomics)
+RWStructuredBuffer<uint>	CellParticles;	// [TableSize * MAX_PER_CELL] particle indices
+
+uint	NumParticles;
+uint	TableSize;
+float	CellSize;	// = self-collision thickness
+
+// Spatial hash of an integer cell coordinate (Teschner et al. 2003).
+uint HashCell(int3 C)
+{
+	const uint H = (uint)(C.x * 73856093) ^ (uint)(C.y * 19349663) ^ (uint)(C.z * 83492791);
+	return H % TableSize;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	const float3 P = PredictedIn[Index];
+	const int3 Cell = (int3)floor(P / CellSize);
+	const uint Bucket = HashCell(Cell);
+
+	uint Slot;
+	InterlockedAdd(CellCounts[Bucket], 1u, Slot);
+	if (Slot < (uint)MAX_PER_CELL)
+	{
+		CellParticles[Bucket * (uint)MAX_PER_CELL + Slot] = Index;
+	}
+	// else: bucket full — drop (broadphase approximation).
+}

@@ -582,6 +582,9 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 
 	FSoftBodyParams Params;
 	Params.NumParticles     = NumParticles;
+	Params.ResX             = ResX;
+	Params.ResY             = ResY;
+	Params.ResZ             = ResZ;
 	Params.DeltaTime        = FixedTimeStep;
 	Params.Gravity          = FVector3f(Gravity);
 	Params.Damping          = Damping;
@@ -592,6 +595,38 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	Params.Friction         = Friction;
 	Params.bGroundPlane     = bGroundPlane;
 	Params.GroundZ          = GroundHeight;
+
+	// Self-collision (SB-M4).
+	Params.bSelfCollision          = bSelfCollision;
+	Params.SelfThickness           = SelfCollisionScale * Spacing;
+	Params.SelfStiffness           = SelfCollisionStiffness;
+	Params.SelfCollisionIterations = SelfCollisionIterations;
+
+	// Sphere/capsule colliders (SB-M4) — build world-space from the authored local slots.
+	const FTransform& ColliderXform = GetComponentTransform();
+	Params.Colliders.Reserve(Colliders.Num());
+	for (const FSoftBodyCollider& C : Colliders)
+	{
+		FGPUCollider G;
+		G.Radius   = C.Radius;
+		G.Friction = Friction;
+
+		if (C.Type == ESoftBodyColliderType::Sphere)
+		{
+			const FVector World = ColliderXform.TransformPosition(C.Center);
+			G.A = FVector3f(World);
+			G.B = G.A; // degenerate capsule == sphere
+		}
+		else // Capsule: endpoints = center ± (axis * halfHeight), local then to world
+		{
+			const FVector Axis = C.Rotation.RotateVector(FVector::UpVector);
+			const FVector LocalA = C.Center + Axis * C.HalfHeight;
+			const FVector LocalB = C.Center - Axis * C.HalfHeight;
+			G.A = FVector3f(ColliderXform.TransformPosition(LocalA));
+			G.B = FVector3f(ColliderXform.TransformPosition(LocalB));
+		}
+		Params.Colliders.Add(G);
+	}
 
 	// Mouse grab (SB-M3) — world-space target pulled toward by the GPU grab pass.
 	Params.bGrabActive   = bIsGrabbing && GrabbedIndex != INDEX_NONE;
@@ -622,6 +657,10 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	if (bDrawDebugPoints)
 	{
 		DrawDebug();
+	}
+	if (bDrawColliders)
+	{
+		DrawColliders();
 	}
 
 	// Grab feedback: a sphere at the cursor target + a line to the grabbed particle.
@@ -733,6 +772,35 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 		{
 			Proxy->UpdateVertices_RenderThread(RHICmdList, Positions, Normals, Tangents);
 		});
+}
+
+void USoftBodyComponent::DrawColliders()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	const FTransform& Xform = GetComponentTransform();
+	const FColor Color = FColor::Yellow;
+
+	for (const FSoftBodyCollider& C : Colliders)
+	{
+		if (C.Type == ESoftBodyColliderType::Sphere)
+		{
+			const FVector Center = Xform.TransformPosition(C.Center);
+			DrawDebugSphere(World, Center, C.Radius, 16, Color, false, -1.0f, SDPG_World, 0.5f);
+		}
+		else // Capsule
+		{
+			const FVector Center = Xform.TransformPosition(C.Center);
+			// UE's DrawDebugCapsule half-height is centre->tip (includes the hemisphere),
+			// while our HalfHeight is the segment half-length, so add the radius.
+			const FQuat Rot = (Xform.GetRotation() * C.Rotation.Quaternion());
+			DrawDebugCapsule(World, Center, C.HalfHeight + C.Radius, C.Radius, Rot, Color, false, -1.0f, SDPG_World, 0.5f);
+		}
+	}
 }
 
 void USoftBodyComponent::UpdateMouseGrab()

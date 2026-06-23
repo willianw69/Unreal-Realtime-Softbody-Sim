@@ -12,6 +12,28 @@
 // Must match [numthreads(...)] in every soft body .usf. Injected as a #define.
 static constexpr uint32 kThreadGroupSize = 64;
 
+// Self-collision hash grid: max particle indices stored per bucket. Injected as MAX_PER_CELL.
+static constexpr uint32 kMaxPerCell = 16;
+
+// Smallest prime >= N, for the spatial-hash table size (reduces modulo clustering).
+static uint32 NextPrime(uint32 N)
+{
+	auto IsPrime = [](uint32 X) -> bool
+	{
+		if (X < 2) return false;
+		if (X % 2 == 0) return X == 2;
+		for (uint32 d = 3; d * d <= X; d += 2)
+		{
+			if (X % d == 0) return false;
+		}
+		return true;
+	};
+	N = FMath::Max(N, 3u);
+	if (N % 2 == 0) ++N;
+	while (!IsPrime(N)) N += 2;
+	return N;
+}
+
 //////////////////////////////////////////////////////////////////////////
 // Shader bindings: Predict -> SolveDistance (colored GS) -> Collision -> Finalize
 //////////////////////////////////////////////////////////////////////////
@@ -101,6 +123,69 @@ public:
 	}
 };
 
+// Self-collision broadphase build: bin particles into a spatial hash grid (SB-M4).
+class FSBBuildGridCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBBuildGridCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBBuildGridCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float3>, PredictedIn)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, CellCounts)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellParticles)
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(uint32, TableSize)
+		SHADER_PARAMETER(float, CellSize)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+		OutEnvironment.SetDefine(TEXT("MAX_PER_CELL"), kMaxPerCell);
+	}
+};
+
+// Self-collision response: scan the 27 neighbour cells, repel close non-adjacent particles (SB-M4).
+class FSBSelfCollisionCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBSelfCollisionCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBSelfCollisionCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float3>, PredictedIn)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CellCounts)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CellParticles)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, PredictedOut)
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(uint32, ResX)
+		SHADER_PARAMETER(uint32, ResY)
+		SHADER_PARAMETER(uint32, ResZ)
+		SHADER_PARAMETER(uint32, TableSize)
+		SHADER_PARAMETER(float, CellSize)
+		SHADER_PARAMETER(float, Thickness)
+		SHADER_PARAMETER(float, SelfStiffness)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+		OutEnvironment.SetDefine(TEXT("MAX_PER_CELL"), kMaxPerCell);
+	}
+};
+
 // Mouse-drag grab: a single thread pulls one grabbed particle toward the cursor (SB-M3).
 class FSBGrabCS : public FGlobalShader
 {
@@ -186,6 +271,8 @@ IMPLEMENT_GLOBAL_SHADER(FSBPredictCS,       "/SoftBodySim/Private/SBPredict.usf"
 IMPLEMENT_GLOBAL_SHADER(FSBSolveDistanceCS, "/SoftBodySim/Private/SBSolveDistance.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveVolumeCS,   "/SoftBodySim/Private/SBSolveVolume.usf",   "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBGrabCS,          "/SoftBodySim/Private/SBGrab.usf",          "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBBuildGridCS,     "/SoftBodySim/Private/SBBuildGrid.usf",     "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBSelfCollisionCS, "/SoftBodySim/Private/SBSelfCollision.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionCS,     "/SoftBodySim/Private/SBCollision.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBFinalizeCS,      "/SoftBodySim/Private/SBFinalize.usf",      "MainCS", SF_Compute);
 
@@ -313,11 +400,13 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	FRDGBufferRef InvMasses  = GraphBuilder.RegisterExternalBuffer(Resources->InvMassBuffer, TEXT("SoftBody.InvMasses"));
 	FRDGBufferSRVRef InvMassesSRV = GraphBuilder.CreateSRV(InvMasses);
 
-	// One predicted-position workspace buffer. The colored Gauss-Seidel solve and the
-	// collision pass both operate in place on it, so no ping-pong is needed. Transient:
-	// recomputed every frame from Positions/Velocities, so no need to persist.
+	// Predicted-position workspace. The colored Gauss-Seidel solve, grab and collision
+	// passes operate in place on PredictedA; the self-collision gather (SB-M4) needs a
+	// clean snapshot to read, so it ping-pongs into PredictedB. Both are transient
+	// (recomputed every frame from Positions/Velocities).
 	const FRDGBufferDesc PredictedDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector3f), Num);
-	FRDGBufferRef Predicted = GraphBuilder.CreateBuffer(PredictedDesc, TEXT("SoftBody.Predicted"));
+	FRDGBufferRef PredictedA = GraphBuilder.CreateBuffer(PredictedDesc, TEXT("SoftBody.PredictedA"));
+	FRDGBufferRef PredictedB = GraphBuilder.CreateBuffer(PredictedDesc, TEXT("SoftBody.PredictedB"));
 
 	const int32 Substeps   = FMath::Max(1, Params.Substeps);
 	const int32 Iterations = FMath::Max(1, Params.SolverIterations);
@@ -374,6 +463,8 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	TShaderMapRef<FSBPredictCS>       PredictCS(ShaderMap);
 	TShaderMapRef<FSBSolveDistanceCS> SolveCS(ShaderMap);
 	TShaderMapRef<FSBSolveVolumeCS>   VolumeCS(ShaderMap);
+	TShaderMapRef<FSBBuildGridCS>     BuildGridCS(ShaderMap);
+	TShaderMapRef<FSBSelfCollisionCS> SelfCollisionCS(ShaderMap);
 	TShaderMapRef<FSBGrabCS>          GrabCS(ShaderMap);
 	TShaderMapRef<FSBCollisionCS>     CollisionCS(ShaderMap);
 	TShaderMapRef<FSBFinalizeCS>      FinalizeCS(ShaderMap);
@@ -382,17 +473,24 @@ void SoftBodyCompute::Dispatch_RenderThread(
 		&& Params.GrabIndex >= 0
 		&& Params.GrabIndex < Num;
 
+	const bool bDoSelfCollision = Params.bSelfCollision && Params.SelfThickness > 0.0f;
+	const uint32 SelfTableSize = NextPrime(2u * (uint32)Num);
+
 	if (SubDt > 0.0f)
 	{
 		for (int32 Step = 0; Step < Substeps; ++Step)
 		{
-			// --- Predict: Positions/Velocities -> Predicted ---
+			// `Solved` tracks the buffer holding the latest positions through the substep.
+			// Starts as PredictedA; the self-collision ping-pong may flip it to PredictedB.
+			FRDGBufferRef Solved = PredictedA;
+
+			// --- Predict: Positions/Velocities -> PredictedA ---
 			{
 				FSBPredictCS::FParameters* P = GraphBuilder.AllocParameters<FSBPredictCS::FParameters>();
 				P->Positions          = GraphBuilder.CreateSRV(Positions);
 				P->Velocities         = GraphBuilder.CreateSRV(Velocities);
 				P->InvMasses          = InvMassesSRV;
-				P->PredictedPositions = GraphBuilder.CreateUAV(Predicted);
+				P->PredictedPositions = GraphBuilder.CreateUAV(PredictedA);
 				P->NumParticles       = (uint32)Num;
 				P->SubDeltaTime       = SubDt;
 				P->Gravity            = Params.Gravity;
@@ -424,7 +522,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 						FSBSolveDistanceCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceCS::FParameters>();
 						P->Constraints = ConstraintsSRV;
 						P->InvMasses   = InvMassesSRV;
-						P->Positions   = GraphBuilder.CreateUAV(Predicted);
+						P->Positions   = GraphBuilder.CreateUAV(Solved);
 						P->ColorStart  = (uint32)Range.Start;
 						P->ColorCount  = (uint32)Range.Count;
 						P->Stiffness   = Params.Stiffness;
@@ -448,7 +546,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 						FSBSolveVolumeCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveVolumeCS::FParameters>();
 						P->VolumeConstraints = VolumeSRV;
 						P->InvMasses         = InvMassesSRV;
-						P->Positions         = GraphBuilder.CreateUAV(Predicted);
+						P->Positions         = GraphBuilder.CreateUAV(Solved);
 						P->ColorStart        = (uint32)Range.Start;
 						P->ColorCount        = (uint32)Range.Count;
 						P->Stiffness         = Params.Stiffness;
@@ -461,13 +559,74 @@ void SoftBodyCompute::Dispatch_RenderThread(
 				}
 			}
 
+			// --- Self-collision: spatial-hash broadphase + Jacobi repulsion (SB-M4) ---
+			// Runs before grab/external colliders so a hard pin or solid collider still gets
+			// the final say. Ping-pongs Solved -> Other so the gather reads a clean snapshot.
+			if (bDoSelfCollision)
+			{
+				const int32 SelfIters = FMath::Max(1, Params.SelfCollisionIterations);
+				for (int32 SIt = 0; SIt < SelfIters; ++SIt)
+				{
+					FRDGBufferRef Other = (Solved == PredictedA) ? PredictedB : PredictedA;
+
+					// CellCounts is a TYPED uint buffer (clean ClearUAV + atomics); CellParticles
+					// is a plain structured index list (never cleared, written by slot).
+					const FRDGBufferDesc CountsDesc   = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), SelfTableSize);
+					const FRDGBufferDesc ParticleDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), SelfTableSize * kMaxPerCell);
+					FRDGBufferRef CellCounts    = GraphBuilder.CreateBuffer(CountsDesc,   TEXT("SoftBody.SelfCellCounts"));
+					FRDGBufferRef CellParticles = GraphBuilder.CreateBuffer(ParticleDesc, TEXT("SoftBody.SelfCellParticles"));
+
+					FRDGBufferUAVRef CellCountsUAV = GraphBuilder.CreateUAV(CellCounts, PF_R32_UINT);
+					AddClearUAVPass(GraphBuilder, CellCountsUAV, 0u);
+
+					// Build: bin particles into the hash grid.
+					{
+						FSBBuildGridCS::FParameters* P = GraphBuilder.AllocParameters<FSBBuildGridCS::FParameters>();
+						P->PredictedIn   = GraphBuilder.CreateSRV(Solved);
+						P->CellCounts    = CellCountsUAV;
+						P->CellParticles = GraphBuilder.CreateUAV(CellParticles);
+						P->NumParticles  = (uint32)Num;
+						P->TableSize     = SelfTableSize;
+						P->CellSize      = Params.SelfThickness;
+
+						FComputeShaderUtils::AddPass(GraphBuilder,
+							RDG_EVENT_NAME("SBBuildGrid (substep %d iter %d)", Step, SIt),
+							BuildGridCS, P, GroupCount);
+					}
+
+					// Respond: repel close non-adjacent particles, writing the other buffer.
+					{
+						FSBSelfCollisionCS::FParameters* P = GraphBuilder.AllocParameters<FSBSelfCollisionCS::FParameters>();
+						P->PredictedIn   = GraphBuilder.CreateSRV(Solved);
+						P->InvMasses     = InvMassesSRV;
+						P->CellCounts    = GraphBuilder.CreateSRV(CellCounts, PF_R32_UINT);
+						P->CellParticles = GraphBuilder.CreateSRV(CellParticles);
+						P->PredictedOut  = GraphBuilder.CreateUAV(Other);
+						P->NumParticles  = (uint32)Num;
+						P->ResX          = (uint32)Params.ResX;
+						P->ResY          = (uint32)Params.ResY;
+						P->ResZ          = (uint32)Params.ResZ;
+						P->TableSize     = SelfTableSize;
+						P->CellSize      = Params.SelfThickness;
+						P->Thickness     = Params.SelfThickness;
+						P->SelfStiffness = Params.SelfStiffness;
+
+						FComputeShaderUtils::AddPass(GraphBuilder,
+							RDG_EVENT_NAME("SBSelfCollision (substep %d iter %d)", Step, SIt),
+							SelfCollisionCS, P, GroupCount);
+					}
+
+					Solved = Other; // corrected positions feed the next iteration / later passes
+				}
+			}
+
 			// --- Grab: pull the mouse-grabbed particle toward the cursor target ---
 			// After the solve (so it's the last word on that vertex), before collision (so
 			// it still can't be dragged through the ground).
 			if (bDoGrab)
 			{
 				FSBGrabCS::FParameters* P = GraphBuilder.AllocParameters<FSBGrabCS::FParameters>();
-				P->PredictedPositions = GraphBuilder.CreateUAV(Predicted);
+				P->PredictedPositions = GraphBuilder.CreateUAV(Solved);
 				P->GrabIndex          = (uint32)Params.GrabIndex;
 				P->GrabTarget         = Params.GrabTarget;
 				P->GrabStiffness      = Params.GrabStiffness;
@@ -481,7 +640,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 			if (CollidersSRV)
 			{
 				FSBCollisionCS::FParameters* P = GraphBuilder.AllocParameters<FSBCollisionCS::FParameters>();
-				P->PredictedPositions = GraphBuilder.CreateUAV(Predicted);   // in place; one thread per particle
+				P->PredictedPositions = GraphBuilder.CreateUAV(Solved);      // in place; one thread per particle
 				P->PrevPositions      = GraphBuilder.CreateSRV(Positions);   // start-of-substep position
 				P->InvMasses          = InvMassesSRV;
 				P->Colliders          = CollidersSRV;
@@ -500,7 +659,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 			// --- Finalize: derive velocity, commit positions ---
 			{
 				FSBFinalizeCS::FParameters* P = GraphBuilder.AllocParameters<FSBFinalizeCS::FParameters>();
-				P->PredictedPositions = GraphBuilder.CreateSRV(Predicted);
+				P->PredictedPositions = GraphBuilder.CreateSRV(Solved);
 				P->InvMasses          = InvMassesSRV;
 				P->Positions          = GraphBuilder.CreateUAV(Positions);
 				P->Velocities         = GraphBuilder.CreateUAV(Velocities);

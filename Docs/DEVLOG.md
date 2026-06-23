@@ -142,4 +142,43 @@ pass is one thread.
 
 ---
 
-<!-- Append SB-M4, SB-M5, … entries below after each milestone is implemented + verified in-editor. -->
+## 2026-06-23 — SB-M4: collisions (sphere/capsule + self)
+**What:** Added shape colliders and self-collision, completing the core feature set.
+*Sphere/capsule colliders:* new `FSoftBodyCollider` USTRUCT (+ `ESoftBodyColliderType`) and a
+`Colliders` array UPROPERTY; in `TickComponent` each is transformed to a world-space `FGPUCollider`
+(sphere → A==B; capsule → A/B = center ± axis·halfHeight) and appended to `Params.Colliders`. The
+existing `SBCollision.usf` (ported in SB-M1 with the full capsule routine) consumes them with no shader
+change — only wiring + a `DrawColliders` wireframe helper. *Self-collision:* ported `ClothBuildGrid.usf`
+→ `SBBuildGrid.usf` (atomic spatial-hash broadphase) and `ClothSelfCollision.usf` → `SBSelfCollision.usf`
+(27-cell Jacobi repulsion), plus `FSBBuildGridCS`/`FSBSelfCollisionCS` and the `NextPrime`/`kMaxPerCell`
+helpers. Adapted the neighbour-exclusion from the cloth's 2D grid 1-ring to the soft body's **3D lattice
+1-ring** (decompose flat index → x/y/z via `ResX/Y/Z`, skip if Chebyshev distance ≤ 1). Added lattice dims
++ `bSelfCollision`/`SelfThickness`/`SelfStiffness`/`SelfCollisionIterations` to `FSoftBodyParams`, and the
+matching component props (`SelfCollisionScale` → thickness = scale·Spacing).
+
+*Dispatch restructure:* the single in-place `Predicted` buffer became `PredictedA`/`PredictedB`. A
+`Solved` ref tracks the current buffer through the substep: the colored solves run in place on PredictedA,
+then (if enabled) self-collision ping-pongs `Solved → Other` per iteration (build grid from Solved →
+repulse into Other → `Solved = Other`), then grab → collision → finalize all read/write `Solved`.
+Self-collision runs before grab/ground so a hard pin or solid floor still gets the final say.
+
+**Why:** Collisions make the jelly interact with the world (drape/squash over shapes) and with itself
+(no interpenetration under compression) — the last piece of the Obi/Zibra-style target. Maximal reuse:
+the analytic-collider shader was already in place from SB-M1, and the self-collision passes are the
+cloth's spatial hash with a one-line topology tweak — another data point that the framework generalizes.
+
+**Problems & solutions:** None — compiled + linked first try. The buffer-aliasing question (self-collision
+needs a clean read snapshot) was handled by reintroducing the second predicted buffer and threading a
+`Solved` ref, mirroring the cloth M9 ping-pong.
+
+**Performance:** Not yet profiled. Self-collision adds a build + scan pass per substep × `SelfCollisionIterations`;
+`MAX_PER_CELL = 16`, table size = `NextPrime(2N)`. Fine at demo resolutions; the broadphase drops pairs on
+bucket overflow in very dense piles (documented).
+
+**Next:** Core milestones (SB-M1–M4) complete — the four user requirements + collisions are delivered.
+Remaining is the SB-M+ stretch list: XPBD compliance, SDF/non-box shapes, render-mesh embedding/skinning,
+multiple bodies, zero-copy vertex write, profiling pass.
+
+---
+
+<!-- Append SB-M+ / further entries below after each is implemented + verified in-editor. -->

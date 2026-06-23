@@ -1,19 +1,22 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-23 (SB-M1–M3 implemented + verified — distance + volume constraints, plus
-> interactive mouse-drag grab).
+> Last updated: 2026-06-23 (SB-M1–M4 implemented + verified — distance + volume constraints, mouse-drag
+> grab, sphere/capsule + spatial-hash self-collision. Core feature set complete).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
-**Status note (through SB-M3):** everything below is implemented. The lattice, the **6-tet Kuhn
+**Status note (through SB-M4):** everything below is implemented. The lattice, the **6-tet Kuhn
 decomposition** (`USoftBodyComponent::BuildTets`), the **distance** constraints from unique tet edges,
-the **per-tet volume** constraints (`SBSolveVolume.usf`, second graph-colored set), the **mouse-drag grab**
-(`SBGrab.usf`, pulls the picked particle after the solve / before collision; pick is CPU from the
-readback), the boundary surface, the `SBPredict → [colored-GS distance + colored-GS volume]×iters →
-[SBGrab] → SBCollision (ground) → SBFinalize → readback` pipeline, and the `FSoftBodyMeshSceneProxy`
-render path all exist and run. The "PredictedA/B ping-pong" row below is a single in-place `Predicted`
-buffer in practice (the colored solves, grab, and collision all write in place). Not yet done:
-sphere/capsule + self-collision (SB-M4).
+the **per-tet volume** constraints (`SBSolveVolume.usf`), the **mouse-drag grab** (`SBGrab.usf`), the
+**sphere/capsule colliders** + **ground plane** (`SBCollision.usf`) and **spatial-hash self-collision**
+(`SBBuildGrid.usf` + `SBSelfCollision.usf`), the boundary surface, and the `FSoftBodyMeshSceneProxy`
+render path all exist and run. Actual per-substep pipeline:
+`SBPredict → [colored-GS distance + colored-GS volume]×iters → [self-collision build+respond ×iters,
+ping-pong] → [SBGrab] → SBCollision (shapes + ground) → SBFinalize → readback`. The "PredictedA/B
+ping-pong" row below is now real: the colored solves/grab/collision write in place on `PredictedA`, and
+self-collision ping-pongs `PredictedA`↔`PredictedB` (a `Solved` ref tracks the current buffer). The core
+feature set is complete; remaining items are the SB-M+ stretch list (XPBD compliance, SDF/non-box shapes,
+render-mesh embedding, profiling).
 
 ## High-Level Architecture (intended, mirrors ClothSim)
 

@@ -1,7 +1,7 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-23 (SB-M3 complete + verified in-editor).
+> Last updated: 2026-06-23 (SB-M4 complete + verified in-editor — core feature set done).
 
 | Milestone | Title | Status |
 |---|---|---|
@@ -9,7 +9,7 @@
 | SB-M1 | GPU lattice solid (framework port + distance constraints) | ✅ |
 | SB-M2 | Volume constraints → jelly (tetrahedra) | ✅ |
 | SB-M3 | Mouse dragging (pick + grab constraint) | ✅ |
-| SB-M4 | Collisions (ground / sphere / self) | ⏳ |
+| SB-M4 | Collisions (ground / sphere / capsule / self) | ✅ |
 | SB-M+ | XPBD compliance, Sphere/SDF shapes, mesh embedding, profiling | ⏳ (stretch) |
 
 ## Notes per Milestone
@@ -50,9 +50,15 @@ drag), and Finalize gives momentum on release. Cursor enabled at BeginPlay; yell
 `bEnableMouseDrag` / `GrabStiffness` / `GrabPickRadiusScale` knobs. Reuses the existing readback +
 param-push — no extra GPU readback. Interactive poke/pull/stretch works.
 
-### SB-M4 — Collisions ⏳
-Port the cloth collision passes: built-in ground plane (already in SB-M1), sphere/capsule colliders,
-and spatial-hash **self-collision**, so the jelly squashes on the floor and against shapes.
+### SB-M4 — Collisions ✅ (verified in-editor 2026-06-23)
+Sphere/capsule colliders (Details-panel `FSoftBodyCollider` array → world-space `FGPUCollider` buffer →
+the existing `SBCollision.usf` capsule routine; yellow wireframe debug draw) plus GPU spatial-hash
+**self-collision** (`SBBuildGrid.usf` atomic broadphase + `SBSelfCollision.usf` 27-cell Jacobi repulsion,
+ported from cloth with the neighbour exclusion adapted to the lattice 1-ring via ResX/Y/Z). Self-collision
+ping-pongs `PredictedA`/`PredictedB` so the gather reads a clean snapshot; runs per substep before
+grab/collision. Knobs: `Colliders`, `bDrawColliders`, `bSelfCollision`, `SelfCollisionScale`/`Stiffness`/
+`Iterations`. The jelly drapes/squashes over shapes and resists interpenetrating itself under compression.
+This completes the Obi/Zibra-style core feature set.
 
 ### SB-M+ — Stretch ⏳
 XPBD compliance per constraint (proper stiffness independent of iteration count); Sphere/arbitrary

@@ -80,6 +80,12 @@ struct FSoftBodyParams
 {
 	int32   NumParticles = 0;
 
+	// Lattice dimensions — needed by self-collision to decompose a flat index into (x,y,z)
+	// and skip a particle's lattice 1-ring neighbours (SB-M4).
+	int32   ResX = 0;
+	int32   ResY = 0;
+	int32   ResZ = 0;
+
 	float   DeltaTime = 1.0f / 60.0f;
 	FVector3f Gravity = FVector3f(0.0f, 0.0f, -980.0f);
 	float   Damping = 0.1f;
@@ -96,13 +102,19 @@ struct FSoftBodyParams
 	FVector3f GrabTarget = FVector3f::ZeroVector;
 	float     GrabStiffness = 0.8f; // [0,1] firmness of the attachment
 
-	// Collision — world-space colliders rebuilt each frame (SB-M4); empty for SB-M1.
+	// Collision — world-space sphere/capsule colliders rebuilt each frame (SB-M4).
 	TArray<FGPUCollider> Colliders;
 	float   Friction = 0.3f;
 
 	// Built-in ground plane — infinite floor at world Z = GroundZ (normal +Z).
 	bool    bGroundPlane = true;
 	float   GroundZ = 0.0f;
+
+	// Self-collision (SB-M4) — body vs itself via a GPU spatial hash grid.
+	bool    bSelfCollision = false;
+	float   SelfThickness = 20.0f;       // min separation between non-adjacent particles (cm)
+	float   SelfStiffness = 1.0f;        // [0,1] repulsion strength
+	int32   SelfCollisionIterations = 2; // repulsion passes per substep (deeper compression)
 };
 
 /**
