@@ -1,22 +1,29 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-23 (SB-M1–M4 implemented + verified — distance + volume constraints, mouse-drag
-> grab, sphere/capsule + spatial-hash self-collision. Core feature set complete).
+> Last updated: 2026-06-23 (SB-M1–M7 implemented + verified — constraints, grab, collisions, custom-mesh
+> embedding, weight-painted stiffness, XPBD distance solve).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
-**Status note (through SB-M4):** everything below is implemented. The lattice, the **6-tet Kuhn
-decomposition** (`USoftBodyComponent::BuildTets`), the **distance** constraints from unique tet edges,
-the **per-tet volume** constraints (`SBSolveVolume.usf`), the **mouse-drag grab** (`SBGrab.usf`), the
-**sphere/capsule colliders** + **ground plane** (`SBCollision.usf`) and **spatial-hash self-collision**
-(`SBBuildGrid.usf` + `SBSelfCollision.usf`), the boundary surface, and the `FSoftBodyMeshSceneProxy`
-render path all exist and run. Actual per-substep pipeline:
-`SBPredict → [colored-GS distance + colored-GS volume]×iters → [self-collision build+respond ×iters,
-ping-pong] → [SBGrab] → SBCollision (shapes + ground) → SBFinalize → readback`. The "PredictedA/B
-ping-pong" row below is now real: the colored solves/grab/collision write in place on `PredictedA`, and
-self-collision ping-pongs `PredictedA`↔`PredictedB` (a `Solved` ref tracks the current buffer). The core
-feature set is complete; remaining items are the SB-M+ stretch list (XPBD compliance, SDF/non-box shapes,
-render-mesh embedding, profiling).
+**Status note (through SB-M7):** the SB-M1–M4 core (lattice, 6-tet Kuhn split, distance + per-tet volume
+constraints, mouse-drag grab, sphere/capsule + ground collision, spatial-hash self-collision, boundary-surface
+render) is all implemented, plus three additions:
+- **Custom mesh embedding (SB-M5):** assign a `UStaticMesh` → the lattice becomes a box **cage** auto-fit to
+  the mesh bounds; each mesh vertex is barycentric-bound to its containing cage tet (`BuildEmbedding`) and
+  reconstructed from the deformed cage each frame. The sim still runs on the cage; only render-vertex sourcing
+  changed. No mesh → the default box boundary surface.
+- **Weight-painted stiffness (SB-M6):** the mesh's vertex-color R channel → per-cage-particle weight
+  (`BuildParticleWeights`) → per-constraint softness.
+- **XPBD distance solve (SB-M7):** `SBSolveDistanceXPBD.usf` with per-constraint compliance + a λ accumulator
+  (reset per substep); `bUseXPBD` toggle; compliance 0 ≡ stiff PBD. Volume solve stays PBD.
+
+Actual per-substep pipeline:
+`SBPredict → [colored-GS distance (XPBD or PBD) + colored-GS volume]×iters → [self-collision build+respond
+×iters, ping-pong] → [SBGrab] → SBCollision (shapes + ground) → SBFinalize → readback`. The "PredictedA/B
+ping-pong" row below is real: the colored solves/grab/collision write in place on `PredictedA`, and
+self-collision ping-pongs `PredictedA`↔`PredictedB` (a `Solved` ref tracks the current buffer). Remaining
+items are the SB-M+ stretch list (SDF/non-box cage shapes, XPBD volume, render-mesh skinning upgrade,
+multiple bodies, profiling).
 
 ## High-Level Architecture (intended, mirrors ClothSim)
 

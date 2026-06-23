@@ -34,7 +34,8 @@ struct FGPUConstraint
 	uint32 IndexA = 0;
 	uint32 IndexB = 0;
 	float  RestLength = 0.0f;
-	float  StiffScale = 1.0f;
+	float  StiffScale = 1.0f;  // PBD path: per-constraint relative stiffness
+	float  Softness = 0.0f;    // XPBD path: [0..1] paint weight (0 firm, 1 soft → compliance)
 };
 
 /**
@@ -93,8 +94,14 @@ struct FSoftBodyParams
 	// XPBD/PBD solver controls.
 	int32   Substeps = 2;          // split DeltaTime for stability (biggest quality lever)
 	int32   SolverIterations = 8;  // constraint relaxation passes per substep
-	float   Stiffness = 1.0f;      // [0,1] global distance-correction scale
+	float   Stiffness = 1.0f;      // [0,1] global distance-correction scale (PBD path)
 	float   VolumeStiffness = 1.0f;// [0,1] per-tet volume-correction scale (SB-M2)
+
+	// Distance solver method (SB-M7). XPBD gives iteration-count-independent stiffness via
+	// per-constraint compliance, so weight-painted softness is robust at any iters/substeps.
+	bool    bUseXPBD = true;
+	float   XpbdGlobalCompliance = 0.0f;   // baseline compliance everywhere (0 = rigid; higher = softer)
+	float   XpbdSoftCompliance = 0.001f;   // extra compliance added at full paint weight (white)
 
 	// Mouse drag (SB-M3) — pull one grabbed particle toward a world-space cursor target.
 	bool      bGrabActive = false;

@@ -1,7 +1,7 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-23 (SB-M4 complete + verified in-editor — core feature set done).
+> Last updated: 2026-06-23 (SB-M5/M6/M7 complete + verified in-editor — custom mesh, weight paint, XPBD).
 
 | Milestone | Title | Status |
 |---|---|---|
@@ -10,7 +10,10 @@
 | SB-M2 | Volume constraints → jelly (tetrahedra) | ✅ |
 | SB-M3 | Mouse dragging (pick + grab constraint) | ✅ |
 | SB-M4 | Collisions (ground / sphere / capsule / self) | ✅ |
-| SB-M+ | XPBD compliance, Sphere/SDF shapes, mesh embedding, profiling | ⏳ (stretch) |
+| SB-M5 | Custom mesh embedding (FFD cage) | ✅ |
+| SB-M6 | Weight-painted per-region stiffness | ✅ |
+| SB-M7 | XPBD compliance (distance solve) | ✅ |
+| SB-M+ | Sphere/SDF cage shapes, render-mesh skinning upgrade, multiple bodies, zero-copy verts, profiling | ⏳ (stretch) |
 
 ## Notes per Milestone
 
@@ -60,7 +63,31 @@ grab/collision. Knobs: `Colliders`, `bDrawColliders`, `bSelfCollision`, `SelfCol
 `Iterations`. The jelly drapes/squashes over shapes and resists interpenetrating itself under compression.
 This completes the Obi/Zibra-style core feature set.
 
+### SB-M5 — Custom mesh embedding ✅ (verified in-editor 2026-06-23)
+Assign a `UStaticMesh` (`SoftBody|Mesh → Source Mesh`): its LOD0 verts/triangles/UVs are read on the CPU
+at BeginPlay, the lattice becomes a box **cage** auto-fit to the mesh bounds (ResX/Y/Z = cage density;
+`CagePadding`), and each mesh vertex is bound to its containing cage tet by **barycentric weights**
+(`BuildEmbedding`, 3×3×3 cell search). Each frame the mesh verts are reconstructed from the deformed cage
+and rendered via the existing proxy (free-form deformation). Everything else (constraints, volume, grab,
+collisions) runs on the cage unchanged. No mesh → the default box.
+
+### SB-M6 — Weight-painted per-region stiffness ✅ (verified in-editor 2026-06-23)
+Paint grayscale **vertex colors** on the Source Mesh (white = soft, black = firm by default); the R channel
+is read alongside positions, sampled onto each cage particle by nearest mesh vertex (`BuildParticleWeights`),
+and drives a per-constraint softness so different parts of one body are floppier/firmer. `bVisualizeWeights`
+tints the debug points (blue→red) to preview the transfer. Knobs: `bWeightPaintStiffness`, `bInvertWeightPaint`.
+(PBD stiffness scaling proved too iteration-coupled to show clearly — fixed properly by SB-M7.)
+
+### SB-M7 — XPBD compliance ✅ (verified in-editor 2026-06-23)
+Converted the distance solve to **XPBD** (`SBSolveDistanceXPBD.usf` + per-constraint Lagrange-multiplier
+buffer reset each substep): stiffness is now a true **compliance** (`α̃ = compliance/dt²`), independent of
+iteration/substep count, so weight-painted softness holds at any solver settings (the SB-M6 contrast no
+longer washes out). Per-constraint compliance = `XpbdGlobalCompliance + Softness·XpbdSoftCompliance`.
+`bUseXPBD` toggles vs the old PBD path (compliance 0 ≡ rigid, so the default matches SB-M1..M6); volume
+stays PBD. The main softness dial is now `XpbdSoftCompliance`.
+
 ### SB-M+ — Stretch ⏳
-XPBD compliance per constraint (proper stiffness independent of iteration count); Sphere/arbitrary
-shapes via SDF voxelization + boundary-from-tets extraction; embed a smooth render mesh skinned to
-the tets; multiple bodies; zero-copy GPU vertex write; `stat GPU`/Insights profiling pass.
+Sphere/arbitrary cage shapes via SDF voxelization + boundary-from-tets extraction; a higher-quality
+render-mesh skinning upgrade (smooth-bind / multi-tet weights); XPBD for the volume solve too; multiple
+bodies; zero-copy GPU vertex write (compute writes the vertex buffer directly); `stat GPU`/Insights
+profiling pass.

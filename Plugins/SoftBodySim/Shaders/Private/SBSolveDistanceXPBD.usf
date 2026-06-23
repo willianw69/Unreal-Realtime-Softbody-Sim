@@ -1,0 +1,94 @@
+// SBSolveDistanceXPBD.usf
+//
+// XPBD variant of the colored Gauss-Seidel distance solve (SB-M7). Same parallelism
+// strategy as the PBD version (one thread per constraint, one dispatch per color,
+// graph-colored so writes are race-free), but the projection uses Extended Position
+// Based Dynamics so stiffness is a true COMPLIANCE that is independent of the iteration
+// count and substep count — exactly what weight-painted softness needs to hold up.
+//
+//   Cerr   = |pa - pb| - rest
+//   alpha~ = compliance / dt^2          (compliance = global + Softness * soft)
+//   dLambda = (-Cerr - alpha~ * lambda) / (wa + wb + alpha~)
+//   lambda += dLambda
+//   pa += +dLambda * wa * n ;  pb += -dLambda * wb * n      (n = (pa-pb)/len)
+//
+// `lambda` (one accumulator per constraint) is reset to 0 at the start of each substep
+// and accumulates across the substep's iterations. compliance = 0 reproduces a fully
+// stiff PBD projection, so the default (no paint, GlobalCompliance 0) matches SB-M1..M6.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+// Must match FGPUConstraint in SoftBodyResources.h (20 bytes).
+struct FConstraint
+{
+	uint	IndexA;
+	uint	IndexB;
+	float	RestLength;
+	float	StiffScale;	// unused here (PBD path); kept for stride parity
+	float	Softness;	// [0..1] paint weight → per-constraint compliance
+};
+
+StructuredBuffer<FConstraint>	Constraints;
+StructuredBuffer<float>			InvMasses;
+RWStructuredBuffer<float3>		Positions;	// in/out (predicted positions, solved in place)
+RWBuffer<float>					Lambdas;	// per-constraint Lagrange multiplier (reset each substep)
+
+uint	ColorStart;			// first constraint index of this color
+uint	ColorCount;			// number of constraints in this color
+float	GlobalCompliance;	// baseline compliance everywhere
+float	SoftCompliance;		// extra compliance at Softness = 1
+float	InvDtSq;			// 1 / (substep dt)^2
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Local = DispatchThreadId.x;
+	if (Local >= ColorCount)
+	{
+		return;
+	}
+
+	const uint Index = ColorStart + Local;
+	const FConstraint C = Constraints[Index];
+
+	const float Wa = InvMasses[C.IndexA];
+	const float Wb = InvMasses[C.IndexB];
+	const float WSum = Wa + Wb;
+	if (WSum <= 1e-8f)
+	{
+		return; // both endpoints pinned
+	}
+
+	const float3 Pa = Positions[C.IndexA];
+	const float3 Pb = Positions[C.IndexB];
+	const float3 D = Pa - Pb;
+	const float Len = length(D);
+	if (Len <= 1e-6f)
+	{
+		return; // coincident; avoid divide-by-zero
+	}
+
+	const float Cerr = Len - C.RestLength;
+	const float3 N = D / Len;
+
+	// Per-constraint compliance from the painted softness.
+	const float AlphaTilde = (GlobalCompliance + C.Softness * SoftCompliance) * InvDtSq;
+
+	const float Lambda = Lambdas[Index];
+	const float DLambda = (-Cerr - AlphaTilde * Lambda) / (WSum + AlphaTilde);
+	Lambdas[Index] = Lambda + DLambda;
+
+	const float3 Corr = DLambda * N;
+	if (Wa > 0.0f)
+	{
+		Positions[C.IndexA] = Pa + (Wa * Corr);
+	}
+	if (Wb > 0.0f)
+	{
+		Positions[C.IndexB] = Pb - (Wb * Corr);
+	}
+}

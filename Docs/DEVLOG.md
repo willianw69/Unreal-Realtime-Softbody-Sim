@@ -181,4 +181,81 @@ multiple bodies, zero-copy vertex write, profiling pass.
 
 ---
 
+## 2026-06-23 — SB-M5: custom mesh embedding (FFD cage)
+**What:** You can now assign a `UStaticMesh` (`SoftBody|Mesh → Source Mesh`) and simulate it. The lattice
+becomes a box **cage** auto-fit to the mesh's bounding box (`CagePadding` expands it); ResX/Y/Z control cage
+density. `ReadSourceMesh` pulls LOD0 positions/indices/UV0 (and vertex colors, used by SB-M6) off the CPU;
+`BuildEmbedding` binds each mesh vertex to the cage tetrahedron containing it via barycentric weights
+(searching the 3×3×3 cell block around the vertex's cage cell; clamps to the nearest tet if slightly outside).
+Each frame `UpdateMeshFromSimulation` reconstructs every mesh vert from its tet's 4 deformed cage particles
+and recomputes normals from the mesh's own triangles. The mesh proxy is already generic, so it renders the
+embedded mesh directly. `ComputeSurfaceNormalsTangents` was generalized to `ComputeNormalsTangents(positions,
+tris, …)`. `EffectiveSpacing` (min cage cell size) now drives self-collision thickness + grab pick radius.
+
+**Why:** "Use a custom mesh as the soft body" — the standard, robust approach is cage-based free-form
+deformation (what Obi and lattice deformers do): simulate a coarse tet cage, ride the high-res mesh along
+by barycentric weights. Chosen over conforming/SDF cages (a stretch item) for simplicity and concave-mesh
+robustness, and it reuses the entire existing sim untouched — only the render-vertex sourcing changed.
+
+**Problems & solutions:** None at build. Design choice: cage stays a box, so a coarse cage deforms blobbily
+(documented; raise Res to follow the silhouette). Vertices outside all cage tets (padding/concavity) clamp
+their barycentric weights to the nearest tet so they stay glued. CPU mesh read needs render data available
+(fine in editor; packaged builds want Allow CPUAccess).
+
+**Performance:** Embedding is built once at init (cell-local search, ~bounded per vertex). Per frame:
+O(mesh verts) reconstruct + normals on the game thread. Heavy for very high-poly meshes; fine for demo assets.
+
+**Next:** SB-M6 — paint per-region softness via the mesh's vertex colors.
+
+## 2026-06-23 — SB-M6: weight-painted per-region stiffness
+**What:** Painted grayscale **vertex colors** on the Source Mesh now make different regions floppier/firmer.
+`ReadSourceMesh` also reads the LOD0 ColorVertexBuffer (R channel → per-vert weight 0..1).
+`BuildParticleWeights` samples that onto each cage particle by nearest mesh vertex. `BuildConstraints` /
+`BuildVolumeConstraints` derive a per-constraint softness from the endpoint weights. `bVisualizeWeights`
+tints the debug points blue(firm)→red(soft) to preview the transfer. Knobs: `bWeightPaintStiffness`,
+`bInvertWeightPaint` (default white = soft).
+
+**Why:** Art-directable softness ("only the ears jiggle") is a core soft-body authoring feature and the
+natural use of the cage + a paint channel. Vertex colors are the most paint-like source for a static mesh
+(paint in the Static Mesh editor or DCC), and the cage already gives us a place to store the sampled weight.
+
+**Problems & solutions:** First pass mapped weight → **PBD stiffness scale**, but the contrast was barely
+visible: PBD stiffness is applied per-iteration, so over 8 iters × 2 substeps even a 0.1 scale converges
+~80% and "soft" looks like "firm". The data path was correct (the weight visualizer confirmed it) — the
+*lever* was wrong. Fixed properly in SB-M7 by switching to XPBD compliance.
+
+**Performance:** Weight transfer is O(cage particles × mesh verts) at init (brute-force nearest) — fine at
+demo sizes; would want a grid accel at very high res/poly.
+
+**Next:** SB-M7 — XPBD so the painted softness is iteration-count-independent.
+
+## 2026-06-23 — SB-M7: XPBD compliance (distance solve)
+**What:** Rewrote the distance solve as **XPBD** (`SBSolveDistanceXPBD.usf` + `FSBSolveDistanceXPBDCS`),
+selected by a `bUseXPBD` toggle (default on; the original PBD shader stays for comparison). Each constraint
+now has a Lagrange multiplier `λ` (a typed-float RDG buffer, sized to the constraint count, cleared to 0 at
+the start of every substep via a uint UAV view) accumulated across the substep's iterations:
+`α̃ = compliance/dt²`, `Δλ = (−C − α̃·λ)/(wa+wb+α̃)`, `λ += Δλ`, `pa += Δλ·wa·n`, `pb −= Δλ·wb·n`.
+Per-constraint compliance = `XpbdGlobalCompliance + Softness·XpbdSoftCompliance`, where `Softness` is the
+painted weight baked into `FGPUConstraint` (struct grew 16→20 B; both distance shaders' `FConstraint` updated
+to match). Volume solve stays PBD.
+
+**Why:** XPBD makes stiffness a true **compliance** (inverse material stiffness) that is independent of
+iteration and substep count — `α̃ = α/dt²` exactly cancels the iteration coupling that washed out SB-M6.
+With it, weight paint produces a strong, predictable firm↔soft difference at any solver settings; compliance
+0 reproduces a fully stiff PBD projection, so the default (unpainted, global compliance 0) matches SB-M1..M6
+behaviour and nothing regresses.
+
+**Problems & solutions:** None at build. λ reset handled by clearing the typed float buffer through a
+`PF_R32_UINT` UAV view to `0u` (0.0f bit pattern), avoiding an engine-version-specific float-clear overload;
+the solve binds a `PF_R32_FLOAT` UAV of the same buffer. Graph coloring already guarantees each constraint
+(hence each λ slot) is touched by exactly one thread per color dispatch, so λ reads/writes are race-free.
+
+**Performance:** Same dispatch count as the PBD distance path + one tiny per-substep clear; an extra λ
+read/write per constraint. Negligible.
+
+**Next:** Core + mesh + art-direction milestones complete. Remaining is the SB-M+ stretch list (SDF cage
+shapes, XPBD volume, render-mesh skinning upgrade, multiple bodies, zero-copy verts, profiling).
+
+---
+
 <!-- Append SB-M+ / further entries below after each is implemented + verified in-editor. -->

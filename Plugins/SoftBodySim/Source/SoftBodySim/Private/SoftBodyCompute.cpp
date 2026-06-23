@@ -94,6 +94,37 @@ public:
 	}
 };
 
+// XPBD distance solve (SB-M7): like FSBSolveDistanceCS but with per-constraint compliance
+// + a Lagrange-multiplier accumulator, for iteration-count-independent stiffness.
+class FSBSolveDistanceXPBDCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBSolveDistanceXPBDCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBSolveDistanceXPBDCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUConstraint>, Constraints)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, Positions)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, Lambdas)
+		SHADER_PARAMETER(uint32, ColorStart)
+		SHADER_PARAMETER(uint32, ColorCount)
+		SHADER_PARAMETER(float, GlobalCompliance)
+		SHADER_PARAMETER(float, SoftCompliance)
+		SHADER_PARAMETER(float, InvDtSq)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+	}
+};
+
 // Graph-colored Gauss-Seidel per-tet volume solve: one thread per tetrahedron, one
 // dispatch per color, moving all 4 vertices in place to restore the rest volume (SB-M2).
 class FSBSolveVolumeCS : public FGlobalShader
@@ -269,6 +300,7 @@ public:
 
 IMPLEMENT_GLOBAL_SHADER(FSBPredictCS,       "/SoftBodySim/Private/SBPredict.usf",       "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveDistanceCS, "/SoftBodySim/Private/SBSolveDistance.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBSolveDistanceXPBDCS, "/SoftBodySim/Private/SBSolveDistanceXPBD.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveVolumeCS,   "/SoftBodySim/Private/SBSolveVolume.usf",   "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBGrabCS,          "/SoftBodySim/Private/SBGrab.usf",          "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBBuildGridCS,     "/SoftBodySim/Private/SBBuildGrid.usf",     "MainCS", SF_Compute);
@@ -460,9 +492,13 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	}
 
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-	TShaderMapRef<FSBPredictCS>       PredictCS(ShaderMap);
-	TShaderMapRef<FSBSolveDistanceCS> SolveCS(ShaderMap);
-	TShaderMapRef<FSBSolveVolumeCS>   VolumeCS(ShaderMap);
+	TShaderMapRef<FSBPredictCS>           PredictCS(ShaderMap);
+	TShaderMapRef<FSBSolveDistanceCS>     SolveCS(ShaderMap);
+	TShaderMapRef<FSBSolveDistanceXPBDCS> SolveXPBDCS(ShaderMap);
+	TShaderMapRef<FSBSolveVolumeCS>       VolumeCS(ShaderMap);
+
+	const bool bUseXPBD = Params.bUseXPBD;
+	const float InvDtSq = (SubDt > 0.0f) ? (1.0f / (SubDt * SubDt)) : 0.0f;
 	TShaderMapRef<FSBBuildGridCS>     BuildGridCS(ShaderMap);
 	TShaderMapRef<FSBSelfCollisionCS> SelfCollisionCS(ShaderMap);
 	TShaderMapRef<FSBGrabCS>          GrabCS(ShaderMap);
@@ -506,6 +542,17 @@ void SoftBodyCompute::Dispatch_RenderThread(
 			// each color reads the previous one's results (RDG serializes the UAV), giving
 			// true Gauss-Seidel propagation. No ping-pong needed. Each iteration relaxes the
 			// distance edges then the per-tet volume constraints, so they converge together.
+			// XPBD (SB-M7) needs a per-constraint Lagrange-multiplier accumulator that is
+			// reset once per substep and carried across the iterations. Typed float buffer;
+			// cleared via a uint view (0u == 0.0f bit pattern).
+			FRDGBufferRef LambdaDist = nullptr;
+			if (bDoConstraints && bUseXPBD)
+			{
+				const FRDGBufferDesc LambdaDesc = FRDGBufferDesc::CreateBufferDesc(sizeof(float), Resources->NumConstraints);
+				LambdaDist = GraphBuilder.CreateBuffer(LambdaDesc, TEXT("SoftBody.LambdaDist"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(LambdaDist, PF_R32_UINT), 0u);
+			}
+
 			const int32 SolveIters = (bDoConstraints || bDoVolume) ? Iterations : 0;
 			for (int32 Iter = 0; Iter < SolveIters; ++Iter)
 			{
@@ -519,17 +566,37 @@ void SoftBodyCompute::Dispatch_RenderThread(
 							continue;
 						}
 
-						FSBSolveDistanceCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceCS::FParameters>();
-						P->Constraints = ConstraintsSRV;
-						P->InvMasses   = InvMassesSRV;
-						P->Positions   = GraphBuilder.CreateUAV(Solved);
-						P->ColorStart  = (uint32)Range.Start;
-						P->ColorCount  = (uint32)Range.Count;
-						P->Stiffness   = Params.Stiffness;
+						if (bUseXPBD)
+						{
+							FSBSolveDistanceXPBDCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceXPBDCS::FParameters>();
+							P->Constraints       = ConstraintsSRV;
+							P->InvMasses         = InvMassesSRV;
+							P->Positions         = GraphBuilder.CreateUAV(Solved);
+							P->Lambdas           = GraphBuilder.CreateUAV(LambdaDist, PF_R32_FLOAT);
+							P->ColorStart        = (uint32)Range.Start;
+							P->ColorCount        = (uint32)Range.Count;
+							P->GlobalCompliance  = Params.XpbdGlobalCompliance;
+							P->SoftCompliance    = Params.XpbdSoftCompliance;
+							P->InvDtSq           = InvDtSq;
 
-						FComputeShaderUtils::AddPass(GraphBuilder,
-							RDG_EVENT_NAME("SBSolveDistance (substep %d iter %d color %d)", Step, Iter, Color),
-							SolveCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
+							FComputeShaderUtils::AddPass(GraphBuilder,
+								RDG_EVENT_NAME("SBSolveDistanceXPBD (substep %d iter %d color %d)", Step, Iter, Color),
+								SolveXPBDCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
+						}
+						else
+						{
+							FSBSolveDistanceCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceCS::FParameters>();
+							P->Constraints = ConstraintsSRV;
+							P->InvMasses   = InvMassesSRV;
+							P->Positions   = GraphBuilder.CreateUAV(Solved);
+							P->ColorStart  = (uint32)Range.Start;
+							P->ColorCount  = (uint32)Range.Count;
+							P->Stiffness   = Params.Stiffness;
+
+							FComputeShaderUtils::AddPass(GraphBuilder,
+								RDG_EVENT_NAME("SBSolveDistance (substep %d iter %d color %d)", Step, Iter, Color),
+								SolveCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
+						}
 					}
 				}
 

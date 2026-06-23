@@ -27,13 +27,15 @@
 #define THREADGROUP_SIZE 64
 #endif
 
-// Must match FGPUConstraint in SoftBodyResources.h (16 bytes).
+// Must match FGPUConstraint in SoftBodyResources.h (20 bytes). Softness is unused by the
+// PBD path but must be present so the struct stride matches the XPBD path.
 struct FConstraint
 {
 	uint	IndexA;
 	uint	IndexB;
 	float	RestLength;
 	float	StiffScale;
+	float	Softness;
 };
 
 StructuredBuffer<FConstraint>	Constraints;

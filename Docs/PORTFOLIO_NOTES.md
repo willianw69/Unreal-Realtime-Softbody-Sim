@@ -140,4 +140,37 @@ and with itself (compressed regions don't interpenetrate). Completes the Obi/Zib
 Chaos, runtime-generated constraints, volume-preserving jelly, mouse-draggable — plus ground/shape/self
 collision, all on a from-scratch compute + RDG framework shared with a sibling cloth simulator.
 
+## SB-M5/M6/M7 — Custom mesh, weight paint, XPBD ✅ 2026-06-23
+**Shipped:** Any Static Mesh can be the soft body (a deformable bunny, not just a box); artists paint
+vertex colors to make regions floppier or firmer; and the solver was upgraded to XPBD so that painted
+softness behaves predictably regardless of solver settings.
+
+**Talking points:**
+- **Cage-based free-form deformation (SB-M5):** simulate a coarse tetrahedral *cage* auto-fit to the mesh's
+  bounds, and skin the high-res render mesh to it with **barycentric embedding** — the same technique behind
+  lattice deformers and tools like Obi. The entire existing GPU sim (constraints, volume, collisions, grab)
+  was reused untouched; only where render vertices come from changed. Clean separation of "simulation proxy"
+  vs "render geometry."
+- **Art-directable material (SB-M6):** painted vertex colors → per-cage-particle weight → per-constraint
+  stiffness. A clean pipeline from a DCC/editor paint channel through to the GPU solver, with a debug
+  visualizer to confirm the transfer.
+- **XPBD compliance (SB-M7) — and knowing *why* you need it:** the first weight-paint attempt used PBD
+  stiffness scaling and the contrast washed out. Diagnosed it as PBD's well-known iteration-coupling (a low
+  per-iteration stiffness still converges over many iterations), then implemented **XPBD** — per-constraint
+  compliance with an accumulated Lagrange multiplier reset each substep (`α̃ = compliance/dt²`) — which makes
+  stiffness a true material property independent of iteration/substep count. A strong "I understand the
+  solver, not just the API" signal: recognizing a perceptual bug as a fundamental method limitation and
+  fixing it at the math level.
+- **Non-destructive upgrade:** XPBD added behind a toggle, with compliance 0 reproducing the prior stiff PBD
+  behaviour, so earlier milestones didn't regress and the two methods can be compared side by side.
+
+**Engineering details worth mentioning:** reading static-mesh LOD0 (positions/indices/UVs/colors) on the
+CPU; barycentric point-in-tet tests with a cell-local search; an RDG typed-float buffer cleared via a uint
+UAV view (0.0f ≡ 0u) to dodge an engine-version-specific clear overload; graph coloring making the λ
+accumulator race-free for free.
+
+**Resume bullet candidate:** "Extended a GPU soft-body solver with cage-based free-form deformation of
+arbitrary meshes, vertex-color-painted per-region stiffness, and an XPBD compliance solver for
+iteration-count-independent material stiffness."
+
 <!-- Append SB-M+ / further sections below as work is completed. -->

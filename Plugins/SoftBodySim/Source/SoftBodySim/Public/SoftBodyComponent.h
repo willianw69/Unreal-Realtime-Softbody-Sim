@@ -12,6 +12,7 @@ struct FGPUConstraint;
 struct FSoftBodyColorRange;
 class FSoftBodyMeshSceneProxy;
 class UMaterialInterface;
+class UStaticMesh;
 
 /** Analytic collider shape authored in the Details panel (SB-M4). */
 UENUM(BlueprintType)
@@ -95,9 +96,63 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "32"))
 	int32 ResZ = 5;
 
-	/** Distance between adjacent lattice particles (cm). */
+	/** Distance between adjacent lattice particles (cm). Used for the default box; when a
+	 *  Source Mesh is assigned the cage auto-fits to the mesh bounds and this is ignored. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "0.1"))
 	float Spacing = 20.0f;
+
+	/**
+	 * Optional custom mesh to simulate (SB-M5). When set, the lattice becomes a box CAGE
+	 * auto-fit to this mesh's bounds (ResX/Y/Z controls cage density), and the mesh's
+	 * render vertices are embedded in the tetrahedra via barycentric weights so the mesh
+	 * deforms with the sim (free-form deformation). Leave null to simulate/render the
+	 * default box. The mesh's LOD0 is read on the CPU at BeginPlay (enable "Allow CPUAccess"
+	 * on the asset for packaged builds; editor works without it).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Mesh")
+	TObjectPtr<UStaticMesh> SourceMesh = nullptr;
+
+	/** Fraction of the mesh bounds to expand the cage by on each side, so surface vertices
+	 *  sit safely inside the tetrahedra. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Mesh", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float CagePadding = 0.05f;
+
+	/**
+	 * Drive per-region stiffness from the Source Mesh's painted VERTEX COLORS (SB-M6).
+	 * Paint a grayscale weight on the mesh (Static Mesh editor Paint mode, or your DCC):
+	 * by default white = soft/wobbly, black = firm. The weight is sampled onto the cage
+	 * particles and scales each constraint's stiffness, so different parts of one body can
+	 * be floppier or firmer. Requires the mesh to have a vertex color channel; with no
+	 * colors (or no Source Mesh) this is ignored and the body uses uniform stiffness.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Weight Paint")
+	bool bWeightPaintStiffness = true;
+
+	/**
+	 * XPBD compliance added to a constraint at full paint weight (white). Higher = the
+	 * painted-soft regions are floppier. This is the main softness lever in XPBD mode
+	 * (bUseXPBD) and, unlike the PBD scales below, its effect does NOT wash out at high
+	 * Solver Iterations.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Weight Paint", meta = (ClampMin = "0.0", ClampMax = "0.02", EditCondition = "bUseXPBD"))
+	float XpbdSoftCompliance = 0.001f;
+
+	/** PBD path only: constraint stiffness scale at the FIRM end (weight = 0 / black). 1 = fully firm. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Weight Paint", meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bUseXPBD"))
+	float FirmStiffnessScale = 1.0f;
+
+	/** PBD path only: constraint stiffness scale at the SOFT end (weight = 1 / white). Lower = floppier.
+	 *  Contrast is strongest at lower Solver Iterations (PBD stiffness is iteration-coupled). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Weight Paint", meta = (ClampMin = "0.01", ClampMax = "1.0", EditCondition = "!bUseXPBD"))
+	float SoftStiffnessScale = 0.1f;
+
+	/** Flip the weight meaning so black = soft and white = firm. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Weight Paint")
+	bool bInvertWeightPaint = false;
+
+	/** Tint the debug points by their sampled weight (firm = blue → soft = red) to preview the paint. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Weight Paint")
+	bool bVisualizeWeights = false;
 
 	/** Optionally pin a face so the body hangs / stays planted (M1 sanity check). */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice")
@@ -162,9 +217,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "1", ClampMax = "64"))
 	int32 SolverIterations = 8;
 
-	/** Distance-constraint correction strength [0..1]. 1 = try to fully satisfy each iteration. */
+	/** Distance-constraint correction strength [0..1] (PBD path only). 1 = try to fully satisfy each iteration. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Stiffness = 1.0f;
+
+	/**
+	 * Use XPBD for the distance solve (SB-M7). XPBD makes stiffness a true compliance that
+	 * is independent of iteration/substep count, so weight-painted softness holds up at any
+	 * solver settings (unlike PBD stiffness, which washes out at high iterations). Leave on
+	 * unless you want to compare against the old PBD path.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver")
+	bool bUseXPBD = true;
+
+	/** XPBD: baseline compliance applied everywhere. 0 = rigid; raise to soften the WHOLE body. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "0.0", ClampMax = "0.02", EditCondition = "bUseXPBD"))
+	float XpbdGlobalCompliance = 0.0f;
 
 	/**
 	 * Per-tet VOLUME-constraint correction strength [0..1] (SB-M2). Higher = firmer
@@ -248,11 +316,30 @@ private:
 	 *  vertices), producing a color-sorted buffer + per-color ranges (SB-M2). */
 	void BuildVolumeConstraints(TArray<FGPUVolumeConstraint>& OutConstraints, TArray<FSoftBodyColorRange>& OutColorRanges) const;
 
-	/** Compute smooth per-vertex normals + arbitrary tangents from the boundary surface (local space). */
-	void ComputeSurfaceNormalsTangents(
+	/** Compute smooth per-vertex normals + arbitrary tangents for a vertex set + triangle
+	 *  list (local space). Used for both the box surface and the embedded custom mesh. */
+	void ComputeNormalsTangents(
 		const TArray<FVector3f>& InPositions,
+		const TArray<uint32>& InTriangles,
 		TArray<FVector3f>& OutNormals,
 		TArray<FVector3f>& OutTangents) const;
+
+	/** Read the assigned SourceMesh's LOD0 positions / triangles / UV0 to the CPU. Returns
+	 *  false (→ fall back to the box) if there's no mesh or its data isn't accessible (SB-M5). */
+	bool ReadSourceMesh();
+
+	/** For each SourceMesh vertex, find the cage tetrahedron containing it and store its
+	 *  barycentric weights, so the mesh can be reconstructed from the deformed cage (SB-M5). */
+	void BuildEmbedding();
+
+	/** Sample the mesh's per-vertex paint weight onto each cage particle (nearest mesh
+	 *  vertex), producing ParticleWeights. No-op (clears data) when weight paint is off,
+	 *  there's no mesh, or the mesh has no vertex colors (SB-M6). */
+	void BuildParticleWeights();
+
+	/** Map a [0,1] paint weight to a per-constraint StiffScale (FirmStiffnessScale at 0,
+	 *  SoftStiffnessScale at 1). Returns 1.0 when no weight data is active. */
+	float WeightToStiffScale(float Weight) const;
 
 	/** Pull the latest readback positions, convert to local space, recompute normals,
 	 *  and push the updated vertices to the scene proxy. */
@@ -282,8 +369,28 @@ private:
 
 	// Static topology (built once).
 	TArray<FSoftBodyTet> Tets;
-	TArray<uint32>       Triangles;
-	TArray<FVector2f>    UV0;
+	TArray<uint32>       Triangles;   // box-surface triangles (non-mesh mode)
+	TArray<FVector2f>    UV0;         // box-surface UVs (non-mesh mode)
+
+	// --- Embedded custom mesh (SB-M5) -------------------------------------
+	bool                 bMeshMode = false;       // true when a valid SourceMesh is embedded
+	int32                NumMeshVerts = 0;
+	TArray<FVector3f>    MeshRestPositions;        // mesh LOD0 verts, component-local rest pose
+	TArray<uint32>       MeshTriangles;            // mesh LOD0 indices
+	TArray<FVector2f>    MeshUV0;                  // mesh LOD0 UV channel 0
+	TArray<int32>        EmbedTet;                 // per mesh vert: containing cage tet index
+	TArray<FVector4f>    EmbedWeights;             // per mesh vert: barycentric (V0,V1,V2,V3)
+	TArray<float>        MeshVertWeights;          // per mesh vert: painted weight (R channel, 0..1)
+	TArray<float>        ParticleWeights;          // per cage particle: sampled weight (0..1)
+	bool                 bHasWeightData = false;   // true when weight-paint stiffness is active
+	FVector3f            CageMin = FVector3f::ZeroVector; // cage local-space bounds (for cell lookup)
+	FVector3f            CageCellSize = FVector3f::OneVector;
+	float                EffectiveSpacing = 20.0f; // min cage cell size (self-collision/grab scale)
+
+	// Scratch reused each frame for the embedded-mesh proxy update (local space).
+	TArray<FVector3f>    MeshLocalPositions;
+	TArray<FVector3f>    MeshNormals;
+	TArray<FVector3f>    MeshTangents;
 
 	// Initial local-space positions (corner at component origin); used to seed the proxy
 	// and to orient the boundary triangle winding.

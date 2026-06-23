@@ -7,10 +7,12 @@
 #include "DrawDebugHelpers.h"
 #include "DynamicMeshBuilder.h"            // FDynamicMeshVertex
 #include "Engine/Engine.h"                 // GEngine on-screen debug
+#include "Engine/StaticMesh.h"             // UStaticMesh (embedded custom mesh, SB-M5)
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h" // mouse pick / deproject (SB-M3)
 #include "Materials/MaterialInterface.h"
 #include "RenderingThread.h"
+#include "StaticMeshResources.h"           // FStaticMeshLODResources CPU read (SB-M5)
 
 USoftBodyComponent::USoftBodyComponent()
 {
@@ -235,7 +237,11 @@ void USoftBodyComponent::BuildConstraints(
 			}
 
 			const float Rest = (InitialLocalPositions[Lo] - InitialLocalPositions[Hi]).Size();
-			Edges.Add(FGPUConstraint{ Lo, Hi, Rest, 1.0f });
+			// Per-edge softness from the painted weights of its endpoints. StiffScale drives
+			// the PBD path (SB-M6); Softness drives the XPBD path's compliance (SB-M7).
+			const float AvgW = bHasWeightData ? 0.5f * (ParticleWeights[Lo] + ParticleWeights[Hi]) : 0.0f;
+			const float Stiff = bHasWeightData ? WeightToStiffScale(AvgW) : 1.0f;
+			Edges.Add(FGPUConstraint{ Lo, Hi, Rest, Stiff, AvgW });
 		}
 	}
 
@@ -332,7 +338,11 @@ void USoftBodyComponent::BuildVolumeConstraints(
 		const FVector3f E3 = P3 - P0;
 		const float RestVol = (1.0f / 6.0f) * FVector3f::DotProduct(E1, FVector3f::CrossProduct(E2, E3));
 
-		Vols.Add(FGPUVolumeConstraint{ T.V0, T.V1, T.V2, T.V3, RestVol, 1.0f });
+		// Per-tet stiffness from the painted weights of its four vertices (SB-M6).
+		const float Stiff = bHasWeightData
+			? WeightToStiffScale(0.25f * (ParticleWeights[T.V0] + ParticleWeights[T.V1] + ParticleWeights[T.V2] + ParticleWeights[T.V3]))
+			: 1.0f;
+		Vols.Add(FGPUVolumeConstraint{ T.V0, T.V1, T.V2, T.V3, RestVol, Stiff });
 	}
 
 	// --- 2. Greedy graph coloring -------------------------------------------
@@ -409,6 +419,215 @@ void USoftBodyComponent::BuildVolumeConstraints(
 	}
 }
 
+// Barycentric weights of point P inside tet (A,B,C,D): returns (wA,wB,wC,wD). The point
+// is inside the tet iff all four are >= 0. Returns a sentinel of all -1 for a degenerate tet.
+static FVector4f TetBarycentric(
+	const FVector3f& A, const FVector3f& B, const FVector3f& C, const FVector3f& D, const FVector3f& P)
+{
+	const FVector3f V0 = B - A;
+	const FVector3f V1 = C - A;
+	const FVector3f V2 = D - A;
+	const FVector3f V3 = P - A;
+
+	const float Denom = FVector3f::DotProduct(V0, FVector3f::CrossProduct(V1, V2));
+	if (FMath::Abs(Denom) < 1e-8f)
+	{
+		return FVector4f(-1.0f, -1.0f, -1.0f, -1.0f);
+	}
+	const float Inv = 1.0f / Denom;
+	const float Wb = FVector3f::DotProduct(V3, FVector3f::CrossProduct(V1, V2)) * Inv;
+	const float Wc = FVector3f::DotProduct(V0, FVector3f::CrossProduct(V3, V2)) * Inv;
+	const float Wd = FVector3f::DotProduct(V0, FVector3f::CrossProduct(V1, V3)) * Inv;
+	const float Wa = 1.0f - Wb - Wc - Wd;
+	return FVector4f(Wa, Wb, Wc, Wd);
+}
+
+bool USoftBodyComponent::ReadSourceMesh()
+{
+	MeshRestPositions.Reset();
+	MeshTriangles.Reset();
+	MeshUV0.Reset();
+	NumMeshVerts = 0;
+
+	if (!SourceMesh)
+	{
+		return false;
+	}
+
+	const FStaticMeshRenderData* RD = SourceMesh->GetRenderData();
+	if (!RD || RD->LODResources.Num() == 0)
+	{
+		return false;
+	}
+
+	const FStaticMeshLODResources& LOD = RD->LODResources[0];
+	const FPositionVertexBuffer& PVB = LOD.VertexBuffers.PositionVertexBuffer;
+	const FStaticMeshVertexBuffer& SVB = LOD.VertexBuffers.StaticMeshVertexBuffer;
+	const FColorVertexBuffer& CVB = LOD.VertexBuffers.ColorVertexBuffer;
+
+	const int32 NumV = (int32)PVB.GetNumVertices();
+	if (NumV == 0)
+	{
+		return false;
+	}
+
+	const bool bHasUV = (SVB.GetNumVertices() == (uint32)NumV) && (SVB.GetNumTexCoords() > 0);
+	// Painted vertex colors → per-vertex weight (R channel). Many meshes have no colors.
+	const bool bHasColor = (CVB.GetNumVertices() == (uint32)NumV);
+
+	MeshRestPositions.SetNumUninitialized(NumV);
+	MeshUV0.SetNumUninitialized(NumV);
+	MeshVertWeights.Reset();
+	if (bHasColor)
+	{
+		MeshVertWeights.SetNumUninitialized(NumV);
+	}
+	for (int32 i = 0; i < NumV; ++i)
+	{
+		MeshRestPositions[i] = PVB.VertexPosition(i);
+		MeshUV0[i] = bHasUV ? SVB.GetVertexUV(i, 0) : FVector2f::ZeroVector;
+		if (bHasColor)
+		{
+			MeshVertWeights[i] = CVB.VertexColor(i).R / 255.0f;
+		}
+	}
+
+	LOD.IndexBuffer.GetCopy(MeshTriangles);
+
+	if (MeshTriangles.Num() < 3)
+	{
+		MeshRestPositions.Reset();
+		MeshUV0.Reset();
+		return false;
+	}
+
+	NumMeshVerts = NumV;
+	return true;
+}
+
+void USoftBodyComponent::BuildEmbedding()
+{
+	EmbedTet.SetNumUninitialized(NumMeshVerts);
+	EmbedWeights.SetNumUninitialized(NumMeshVerts);
+
+	const int32 CellsX = ResX - 1;
+	const int32 CellsY = ResY - 1;
+
+	for (int32 v = 0; v < NumMeshVerts; ++v)
+	{
+		const FVector3f P = MeshRestPositions[v];
+
+		// Base cage cell for this vertex (clamped); search a 3x3x3 block around it so a
+		// vertex near a cell boundary or just outside (padding/concavity) still binds.
+		const int32 Bx = FMath::Clamp((int32)FMath::FloorToInt((P.X - CageMin.X) / CageCellSize.X), 0, CellsX - 1);
+		const int32 By = FMath::Clamp((int32)FMath::FloorToInt((P.Y - CageMin.Y) / CageCellSize.Y), 0, CellsY - 1);
+		const int32 Bz = FMath::Clamp((int32)FMath::FloorToInt((P.Z - CageMin.Z) / CageCellSize.Z), 0, ResZ - 2);
+
+		int32   BestTet = 0;
+		FVector4f BestW(0.25f, 0.25f, 0.25f, 0.25f);
+		float   BestMin = -FLT_MAX; // maximise the minimum weight → best containment
+
+		for (int32 dz = -1; dz <= 1; ++dz)
+		for (int32 dy = -1; dy <= 1; ++dy)
+		for (int32 dx = -1; dx <= 1; ++dx)
+		{
+			const int32 Cx = Bx + dx;
+			const int32 Cy = By + dy;
+			const int32 Cz = Bz + dz;
+			if (Cx < 0 || Cy < 0 || Cz < 0 || Cx >= CellsX || Cy >= CellsY || Cz >= ResZ - 1)
+			{
+				continue;
+			}
+
+			// Cell → tet base (matches BuildTets iteration order: Z outer, Y, X inner, 6/cell).
+			const int32 CellLinear = (Cz * CellsY + Cy) * CellsX + Cx;
+			const int32 TetBase = CellLinear * 6;
+
+			for (int32 t = 0; t < 6; ++t)
+			{
+				const FSoftBodyTet& T = Tets[TetBase + t];
+				const FVector4f W = TetBarycentric(
+					InitialLocalPositions[T.V0], InitialLocalPositions[T.V1],
+					InitialLocalPositions[T.V2], InitialLocalPositions[T.V3], P);
+
+				const float MinW = FMath::Min(FMath::Min(W.X, W.Y), FMath::Min(W.Z, W.W));
+				if (MinW > BestMin)
+				{
+					BestMin = MinW;
+					BestTet = TetBase + t;
+					BestW = W;
+				}
+				if (MinW >= 0.0f)
+				{
+					// Fully contained — can't do better than this.
+					dx = dy = dz = 2; // break all three loops
+					break;
+				}
+			}
+		}
+
+		// If the best tet doesn't strictly contain the vertex (slightly outside), clamp the
+		// weights to the tet's convex hull so it stays glued instead of flying off.
+		if (BestMin < 0.0f)
+		{
+			FVector4f W = BestW;
+			W.X = FMath::Max(W.X, 0.0f);
+			W.Y = FMath::Max(W.Y, 0.0f);
+			W.Z = FMath::Max(W.Z, 0.0f);
+			W.W = FMath::Max(W.W, 0.0f);
+			const float Sum = W.X + W.Y + W.Z + W.W;
+			BestW = (Sum > KINDA_SMALL_NUMBER) ? (W * (1.0f / Sum)) : FVector4f(0.25f, 0.25f, 0.25f, 0.25f);
+		}
+
+		EmbedTet[v] = BestTet;
+		EmbedWeights[v] = BestW;
+	}
+}
+
+void USoftBodyComponent::BuildParticleWeights()
+{
+	ParticleWeights.Reset();
+	bHasWeightData = false;
+
+	// Only active with a mesh that has painted colors and the feature enabled.
+	if (!bMeshMode || !bWeightPaintStiffness || MeshVertWeights.Num() != NumMeshVerts || NumMeshVerts == 0)
+	{
+		return;
+	}
+
+	// Each cage particle inherits the paint weight of the nearest mesh vertex (the closest
+	// painted surface point). Brute-force nearest at init — fine at demo cage/mesh sizes.
+	ParticleWeights.SetNumUninitialized(NumParticles);
+	for (int32 p = 0; p < NumParticles; ++p)
+	{
+		const FVector3f Pp = InitialLocalPositions[p];
+		float BestDistSq = FLT_MAX;
+		float BestW = 1.0f;
+		for (int32 v = 0; v < NumMeshVerts; ++v)
+		{
+			const float DistSq = FVector3f::DistSquared(Pp, MeshRestPositions[v]);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestW = MeshVertWeights[v];
+			}
+		}
+		ParticleWeights[p] = bInvertWeightPaint ? (1.0f - BestW) : BestW;
+	}
+
+	bHasWeightData = true;
+}
+
+float USoftBodyComponent::WeightToStiffScale(float Weight) const
+{
+	if (!bHasWeightData)
+	{
+		return 1.0f;
+	}
+	// Weight 0 (firm) → FirmStiffnessScale; weight 1 (soft) → SoftStiffnessScale.
+	return FMath::Lerp(FirmStiffnessScale, SoftStiffnessScale, FMath::Clamp(Weight, 0.0f, 1.0f));
+}
+
 void USoftBodyComponent::InitializeSimulation()
 {
 	ResX = FMath::Clamp(ResX, 2, 32);
@@ -436,43 +655,101 @@ void USoftBodyComponent::InitializeSimulation()
 		}
 	}
 
-	TArray<FVector3f> Positions;   // world space (sim runs in world space)
-	TArray<FVector3f> Velocities;
-	TArray<float>     InvMasses;
-	Positions.Reserve(NumParticles);
-	Velocities.Reserve(NumParticles);
-	InvMasses.Reserve(NumParticles);
+	// A custom mesh (SB-M5) turns the lattice into a box CAGE auto-fit to the mesh bounds;
+	// otherwise we simulate/render the default centered box.
+	bMeshMode = ReadSourceMesh();
+
+	// --- Cage local-space layout -------------------------------------------
 	InitialLocalPositions.Reset();
-	InitialLocalPositions.Reserve(NumParticles);
+	InitialLocalPositions.SetNumUninitialized(NumParticles);
 
-	const FTransform& Xform = GetComponentTransform();
-
-	// Lattice centered in X/Y about the component origin, base at local Z = 0.
-	const float HalfX = 0.5f * (ResX - 1) * Spacing;
-	const float HalfY = 0.5f * (ResY - 1) * Spacing;
-
-	for (int32 Z = 0; Z < ResZ; ++Z)
+	if (bMeshMode)
 	{
-		for (int32 Y = 0; Y < ResY; ++Y)
+		// Bounding box of the mesh, padded so surface verts sit inside the cage.
+		FBox MeshBox(ForceInit);
+		for (const FVector3f& P : MeshRestPositions)
 		{
-			for (int32 X = 0; X < ResX; ++X)
+			MeshBox += FVector(P);
+		}
+		const FVector Pad = MeshBox.GetSize() * CagePadding;
+		MeshBox.Min -= Pad;
+		MeshBox.Max += Pad;
+		// Guard against a flat axis (zero size → divide-by-zero in the cell mapping).
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			if (MeshBox.Max[Axis] - MeshBox.Min[Axis] < 1.0f)
 			{
-				const FVector Local(X * Spacing - HalfX, Y * Spacing - HalfY, Z * Spacing);
-				InitialLocalPositions.Add(FVector3f(Local));
-
-				Positions.Add(FVector3f(Xform.TransformPosition(Local)));
-				Velocities.Add(FVector3f::ZeroVector);
-
-				const bool bPinned =
-					(Anchor == ESoftBodyAnchor::TopFace && Z == ResZ - 1) ||
-					(Anchor == ESoftBodyAnchor::BottomFace && Z == 0);
-				InvMasses.Add(bPinned ? 0.0f : 1.0f);
+				MeshBox.Min[Axis] -= 0.5f;
+				MeshBox.Max[Axis] += 0.5f;
 			}
+		}
+
+		const FVector Size = MeshBox.GetSize();
+		CageMin = FVector3f(MeshBox.Min);
+		CageCellSize = FVector3f(Size.X / (ResX - 1), Size.Y / (ResY - 1), Size.Z / (ResZ - 1));
+		EffectiveSpacing = FMath::Min3(CageCellSize.X, CageCellSize.Y, CageCellSize.Z);
+
+		for (int32 Z = 0; Z < ResZ; ++Z)
+		for (int32 Y = 0; Y < ResY; ++Y)
+		for (int32 X = 0; X < ResX; ++X)
+		{
+			InitialLocalPositions[LatticeIndex(X, Y, Z)] = CageMin +
+				FVector3f(X * CageCellSize.X, Y * CageCellSize.Y, Z * CageCellSize.Z);
+		}
+	}
+	else
+	{
+		// Centered box in X/Y about the component origin, base at local Z = 0.
+		const float HalfX = 0.5f * (ResX - 1) * Spacing;
+		const float HalfY = 0.5f * (ResY - 1) * Spacing;
+		CageMin = FVector3f(-HalfX, -HalfY, 0.0f);
+		CageCellSize = FVector3f(Spacing, Spacing, Spacing);
+		EffectiveSpacing = Spacing;
+
+		for (int32 Z = 0; Z < ResZ; ++Z)
+		for (int32 Y = 0; Y < ResY; ++Y)
+		for (int32 X = 0; X < ResX; ++X)
+		{
+			InitialLocalPositions[LatticeIndex(X, Y, Z)] =
+				FVector3f(X * Spacing - HalfX, Y * Spacing - HalfY, Z * Spacing);
 		}
 	}
 
+	// --- World state from the cage layout ----------------------------------
+	TArray<FVector3f> Positions;   // world space (sim runs in world space)
+	TArray<FVector3f> Velocities;
+	TArray<float>     InvMasses;
+	Positions.SetNumUninitialized(NumParticles);
+	Velocities.SetNumUninitialized(NumParticles);
+	InvMasses.SetNumUninitialized(NumParticles);
+
+	const FTransform& Xform = GetComponentTransform();
+	for (int32 Z = 0; Z < ResZ; ++Z)
+	for (int32 Y = 0; Y < ResY; ++Y)
+	for (int32 X = 0; X < ResX; ++X)
+	{
+		const int32 i = LatticeIndex(X, Y, Z);
+		Positions[i] = FVector3f(Xform.TransformPosition(FVector(InitialLocalPositions[i])));
+		Velocities[i] = FVector3f::ZeroVector;
+
+		const bool bPinned =
+			(Anchor == ESoftBodyAnchor::TopFace && Z == ResZ - 1) ||
+			(Anchor == ESoftBodyAnchor::BottomFace && Z == 0);
+		InvMasses[i] = bPinned ? 0.0f : 1.0f;
+	}
+
 	BuildTets();
-	BuildBoundarySurface();
+	if (bMeshMode)
+	{
+		BuildEmbedding();         // bind the mesh verts to the cage tets
+		BuildParticleWeights();   // sample painted weights onto the cage (SB-M6)
+	}
+	else
+	{
+		BuildBoundarySurface();   // box-surface render geometry
+		ParticleWeights.Reset();
+		bHasWeightData = false;
+	}
 
 	// Generous local bounds so the body isn't frustum-culled as it sags/jiggles.
 	FBox Box(ForceInit);
@@ -480,7 +757,7 @@ void USoftBodyComponent::InitializeSimulation()
 	{
 		Box += FVector(P);
 	}
-	const float Margin = (ResX + ResY + ResZ) * Spacing;
+	const float Margin = (ResX + ResY + ResZ) * EffectiveSpacing;
 	Box = Box.ExpandBy(Margin);
 	LocalBounds = FBoxSphereBounds(Box);
 
@@ -540,28 +817,38 @@ void USoftBodyComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMateri
 
 FPrimitiveSceneProxy* USoftBodyComponent::CreateSceneProxy()
 {
-	if (NumParticles <= 0 || Triangles.Num() == 0 || InitialLocalPositions.Num() != NumParticles)
+	if (NumParticles <= 0 || InitialLocalPositions.Num() != NumParticles)
 	{
 		return nullptr; // not initialised yet (e.g. editor, before BeginPlay)
 	}
 
-	// Seed the proxy with the initial (rest) mesh; normals computed from the surface.
+	// Render either the embedded custom mesh (SB-M5) or the box boundary surface.
+	const TArray<FVector3f>& RestPos = bMeshMode ? MeshRestPositions : InitialLocalPositions;
+	const TArray<uint32>&    RenderTris = bMeshMode ? MeshTriangles : Triangles;
+	const TArray<FVector2f>& RenderUV = bMeshMode ? MeshUV0 : UV0;
+	const int32 NumV = RestPos.Num();
+	if (NumV == 0 || RenderTris.Num() == 0)
+	{
+		return nullptr;
+	}
+
+	// Seed the proxy with the initial (rest) mesh; normals computed from its triangles.
 	TArray<FVector3f> SeedNormals, SeedTangents;
-	ComputeSurfaceNormalsTangents(InitialLocalPositions, SeedNormals, SeedTangents);
+	ComputeNormalsTangents(RestPos, RenderTris, SeedNormals, SeedTangents);
 
 	TArray<FDynamicMeshVertex> Vertices;
-	Vertices.SetNumUninitialized(NumParticles);
-	for (int32 i = 0; i < NumParticles; ++i)
+	Vertices.SetNumUninitialized(NumV);
+	for (int32 i = 0; i < NumV; ++i)
 	{
 		FDynamicMeshVertex& V = Vertices[i];
-		V.Position = InitialLocalPositions[i];
-		V.TextureCoordinate[0] = UV0[i];
+		V.Position = RestPos[i];
+		V.TextureCoordinate[0] = RenderUV[i];
 		V.TangentX = SeedTangents[i];
 		V.TangentZ = SeedNormals[i];
 		V.Color = FColor::White;
 	}
 
-	return new FSoftBodyMeshSceneProxy(this, Vertices, Triangles, SoftBodyMaterial);
+	return new FSoftBodyMeshSceneProxy(this, Vertices, RenderTris, SoftBodyMaterial);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -592,13 +879,16 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	Params.SolverIterations = SolverIterations;
 	Params.Stiffness        = Stiffness;
 	Params.VolumeStiffness  = VolumeStiffness;
+	Params.bUseXPBD            = bUseXPBD;
+	Params.XpbdGlobalCompliance = XpbdGlobalCompliance;
+	Params.XpbdSoftCompliance   = XpbdSoftCompliance;
 	Params.Friction         = Friction;
 	Params.bGroundPlane     = bGroundPlane;
 	Params.GroundZ          = GroundHeight;
 
 	// Self-collision (SB-M4).
 	Params.bSelfCollision          = bSelfCollision;
-	Params.SelfThickness           = SelfCollisionScale * Spacing;
+	Params.SelfThickness           = SelfCollisionScale * EffectiveSpacing;
 	Params.SelfStiffness           = SelfCollisionStiffness;
 	Params.SelfCollisionIterations = SelfCollisionIterations;
 
@@ -683,35 +973,40 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	{
 		GEngine->AddOnScreenDebugMessage(
 			(uint64)(UPTRINT)this + 1, 0.0f, FColor::Cyan,
-			FString::Printf(TEXT("SoftBody  lattice=%dx%dx%d  particles=%d  tets=%d"),
-				ResX, ResY, ResZ, NumParticles, Tets.Num()));
+			FString::Printf(TEXT("SoftBody  cage=%dx%dx%d  particles=%d  tets=%d%s%s"),
+				ResX, ResY, ResZ, NumParticles, Tets.Num(),
+				bMeshMode ? *FString::Printf(TEXT("  | embedded mesh verts=%d"), NumMeshVerts) : TEXT(""),
+				bHasWeightData ? TEXT("  | weight-paint stiffness ON") : TEXT("")));
 
 		// Total solve dispatches per substep = iters * (distance colors + volume colors).
 		const int32 SolveDispatches = SolverIterations * (NumColorsBuilt + NumVolumeColorsBuilt);
 		GEngine->AddOnScreenDebugMessage(
 			(uint64)(UPTRINT)this + 2, 0.0f, FColor::Cyan,
-			FString::Printf(TEXT("  dist: constraints=%d colors=%d  |  vol: tets=%d colors=%d  |  substeps=%d iters=%d  dispatches/substep=%d"),
+			FString::Printf(TEXT("  [%s]  dist: constraints=%d colors=%d  |  vol: tets=%d colors=%d  |  substeps=%d iters=%d  dispatches/substep=%d"),
+				bUseXPBD ? TEXT("XPBD") : TEXT("PBD"),
 				NumConstraintsBuilt, NumColorsBuilt, NumVolumeConstraintsBuilt, NumVolumeColorsBuilt,
 				Substeps, SolverIterations, SolveDispatches));
 	}
 }
 
-void USoftBodyComponent::ComputeSurfaceNormalsTangents(
+void USoftBodyComponent::ComputeNormalsTangents(
 	const TArray<FVector3f>& InPositions,
+	const TArray<uint32>& InTriangles,
 	TArray<FVector3f>& OutNormals,
 	TArray<FVector3f>& OutTangents) const
 {
-	OutNormals.Init(FVector3f::ZeroVector, NumParticles);
-	OutTangents.Init(FVector3f::ZeroVector, NumParticles);
+	const int32 Count = InPositions.Num();
+	OutNormals.Init(FVector3f::ZeroVector, Count);
+	OutTangents.Init(FVector3f::ZeroVector, Count);
 
-	// Area-weighted face normals accumulated to each boundary vertex. Cross(E2,E1) (not
-	// E1,E2) so the smooth normal agrees with UE's left-handed front-face winding, which
-	// is what makes a TWO-SIDED material shade correctly (cloth M9 lesson).
-	for (int32 t = 0; t < Triangles.Num(); t += 3)
+	// Area-weighted face normals accumulated to each vertex. Cross(E2,E1) (not E1,E2) so
+	// the smooth normal agrees with UE's left-handed front-face winding, which is what
+	// makes a TWO-SIDED material shade correctly (cloth M9 lesson).
+	for (int32 t = 0; t + 2 < InTriangles.Num(); t += 3)
 	{
-		const uint32 I0 = Triangles[t];
-		const uint32 I1 = Triangles[t + 1];
-		const uint32 I2 = Triangles[t + 2];
+		const uint32 I0 = InTriangles[t];
+		const uint32 I1 = InTriangles[t + 1];
+		const uint32 I2 = InTriangles[t + 2];
 
 		const FVector3f E1 = InPositions[I1] - InPositions[I0];
 		const FVector3f E2 = InPositions[I2] - InPositions[I0];
@@ -722,7 +1017,7 @@ void USoftBodyComponent::ComputeSurfaceNormalsTangents(
 		OutNormals[I2] += FaceN;
 	}
 
-	for (int32 i = 0; i < NumParticles; ++i)
+	for (int32 i = 0; i < Count; ++i)
 	{
 		const FVector3f N = OutNormals[i].GetSafeNormal(SMALL_NUMBER, FVector3f(0.0f, 0.0f, 1.0f));
 		OutNormals[i] = N;
@@ -763,7 +1058,33 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 		}
 	}
 
-	ComputeSurfaceNormalsTangents(LocalPositions, LocalNormals, LocalTangents);
+	if (bMeshMode)
+	{
+		// Reconstruct each mesh vertex from its cage tet via the barycentric weights.
+		MeshLocalPositions.SetNumUninitialized(NumMeshVerts);
+		for (int32 v = 0; v < NumMeshVerts; ++v)
+		{
+			const FSoftBodyTet& T = Tets[EmbedTet[v]];
+			const FVector4f& W = EmbedWeights[v];
+			MeshLocalPositions[v] =
+				W.X * LocalPositions[T.V0] +
+				W.Y * LocalPositions[T.V1] +
+				W.Z * LocalPositions[T.V2] +
+				W.W * LocalPositions[T.V3];
+		}
+
+		ComputeNormalsTangents(MeshLocalPositions, MeshTriangles, MeshNormals, MeshTangents);
+
+		ENQUEUE_RENDER_COMMAND(SoftBodyMeshUpdate)(
+			[Proxy, Positions = MeshLocalPositions, Normals = MeshNormals, Tangents = MeshTangents]
+			(FRHICommandListImmediate& RHICmdList)
+			{
+				Proxy->UpdateVertices_RenderThread(RHICmdList, Positions, Normals, Tangents);
+			});
+		return;
+	}
+
+	ComputeNormalsTangents(LocalPositions, Triangles, LocalNormals, LocalTangents);
 
 	// Hand the new vertex data to the proxy on the render thread.
 	ENQUEUE_RENDER_COMMAND(SoftBodyMeshUpdate)(
@@ -873,7 +1194,7 @@ void USoftBodyComponent::UpdateMouseGrab()
 			}
 		}
 
-		const float PickRadius = Spacing * GrabPickRadiusScale;
+		const float PickRadius = EffectiveSpacing * GrabPickRadiusScale;
 		if (BestIndex != INDEX_NONE && BestDistSq <= PickRadius * PickRadius)
 		{
 			GrabbedIndex = BestIndex;
@@ -907,9 +1228,19 @@ void USoftBodyComponent::DrawDebug()
 		return;
 	}
 
+	// Optionally tint each cage particle by its painted weight (firm = blue → soft = red)
+	// so the transferred weight paint is visible.
+	const bool bWeightTint = bVisualizeWeights && bHasWeightData && ParticleWeights.Num() == RenderResources->PositionCopy.Num();
+
 	for (int32 i = 0; i < RenderResources->PositionCopy.Num(); ++i)
 	{
-		DrawDebugPoint(World, FVector(RenderResources->PositionCopy[i]), DebugPointSize, FColor::Cyan, false, -1.0f, SDPG_World);
+		FColor Color = FColor::Cyan;
+		if (bWeightTint)
+		{
+			const float W = ParticleWeights[i];
+			Color = FMath::Lerp(FLinearColor(0.0f, 0.35f, 1.0f), FLinearColor(1.0f, 0.0f, 0.0f), W).ToFColor(false);
+		}
+		DrawDebugPoint(World, FVector(RenderResources->PositionCopy[i]), DebugPointSize, Color, false, -1.0f, SDPG_World);
 	}
 }
 
