@@ -8,6 +8,7 @@
 #include "DynamicMeshBuilder.h"            // FDynamicMeshVertex
 #include "Engine/Engine.h"                 // GEngine on-screen debug
 #include "Engine/World.h"
+#include "GameFramework/PlayerController.h" // mouse pick / deproject (SB-M3)
 #include "Materials/MaterialInterface.h"
 #include "RenderingThread.h"
 
@@ -34,6 +35,20 @@ void USoftBodyComponent::BeginPlay()
 	// We now have geometry: rebuild bounds and recreate the (previously empty) proxy.
 	UpdateBounds();
 	MarkRenderStateDirty();
+
+	// Show the cursor so the player can click-drag the body (SB-M3).
+	if (bEnableMouseDrag)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				PC->bShowMouseCursor = true;
+				PC->bEnableClickEvents = true;
+				PC->bEnableMouseOverEvents = true;
+			}
+		}
+	}
 }
 
 void USoftBodyComponent::BuildTets()
@@ -401,6 +416,26 @@ void USoftBodyComponent::InitializeSimulation()
 	ResZ = FMath::Clamp(ResZ, 2, 32);
 	NumParticles = ResX * ResY * ResZ;
 
+	// Surface particles (any on a face of the box) — the only ones the mouse can grab.
+	BoundaryParticles.Reset();
+	for (int32 Z = 0; Z < ResZ; ++Z)
+	{
+		for (int32 Y = 0; Y < ResY; ++Y)
+		{
+			for (int32 X = 0; X < ResX; ++X)
+			{
+				const bool bOnSurface =
+					X == 0 || X == ResX - 1 ||
+					Y == 0 || Y == ResY - 1 ||
+					Z == 0 || Z == ResZ - 1;
+				if (bOnSurface)
+				{
+					BoundaryParticles.Add(LatticeIndex(X, Y, Z));
+				}
+			}
+		}
+	}
+
 	TArray<FVector3f> Positions;   // world space (sim runs in world space)
 	TArray<FVector3f> Velocities;
 	TArray<float>     InvMasses;
@@ -542,6 +577,9 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		return;
 	}
 
+	// Mouse pick/drag — updates GrabbedIndex / CurrentGrabTarget for the params below.
+	UpdateMouseGrab();
+
 	FSoftBodyParams Params;
 	Params.NumParticles     = NumParticles;
 	Params.DeltaTime        = FixedTimeStep;
@@ -554,6 +592,12 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	Params.Friction         = Friction;
 	Params.bGroundPlane     = bGroundPlane;
 	Params.GroundZ          = GroundHeight;
+
+	// Mouse grab (SB-M3) — world-space target pulled toward by the GPU grab pass.
+	Params.bGrabActive   = bIsGrabbing && GrabbedIndex != INDEX_NONE;
+	Params.GrabIndex     = GrabbedIndex;
+	Params.GrabTarget    = FVector3f(CurrentGrabTarget);
+	Params.GrabStiffness = GrabStiffness;
 
 	// Fixed-timestep accumulator (frame-rate independent).
 	TimeAccumulator += DeltaTime;
@@ -578,6 +622,22 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	if (bDrawDebugPoints)
 	{
 		DrawDebug();
+	}
+
+	// Grab feedback: a sphere at the cursor target + a line to the grabbed particle.
+	if (bIsGrabbing && GrabbedIndex != INDEX_NONE)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			DrawDebugSphere(World, CurrentGrabTarget, 6.0f, 12, FColor::Yellow, false, -1.0f, SDPG_World, 0.5f);
+
+			FScopeLock Lock(&RenderResources->PositionCopyCS);
+			if (RenderResources->bHasPositionData && RenderResources->PositionCopy.IsValidIndex(GrabbedIndex))
+			{
+				DrawDebugLine(World, FVector(RenderResources->PositionCopy[GrabbedIndex]), CurrentGrabTarget,
+					FColor::Yellow, false, -1.0f, SDPG_World, 0.5f);
+			}
+		}
 	}
 
 	if (bShowStats && GEngine)
@@ -673,6 +733,96 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 		{
 			Proxy->UpdateVertices_RenderThread(RHICmdList, Positions, Normals, Tangents);
 		});
+}
+
+void USoftBodyComponent::UpdateMouseGrab()
+{
+	// Default to "not grabbing"; any early-out below leaves the body free.
+	auto ClearGrab = [&]()
+	{
+		bIsGrabbing = false;
+		GrabbedIndex = INDEX_NONE;
+	};
+
+	if (!bEnableMouseDrag || !RenderResources.IsValid())
+	{
+		ClearGrab();
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!PC)
+	{
+		ClearGrab();
+		return;
+	}
+
+	// Released (or never pressed): drop the grab so the body springs back.
+	if (!PC->IsInputKeyDown(EKeys::LeftMouseButton))
+	{
+		ClearGrab();
+		return;
+	}
+
+	// Cursor world ray.
+	FVector RayOrigin, RayDir;
+	if (!PC->DeprojectMousePositionToWorld(RayOrigin, RayDir))
+	{
+		return; // keep any existing grab; just can't update the ray this frame
+	}
+	RayDir = RayDir.GetSafeNormal();
+
+	// On the first frame of a press, pick the boundary particle whose world position lies
+	// closest to the click ray (and is in front of the camera).
+	if (!bIsGrabbing)
+	{
+		FScopeLock Lock(&RenderResources->PositionCopyCS);
+		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles)
+		{
+			return; // readback not ready yet
+		}
+
+		float BestDistSq = TNumericLimits<float>::Max();
+		int32 BestIndex = INDEX_NONE;
+		float BestDepth = 0.0f;
+
+		for (int32 Idx : BoundaryParticles)
+		{
+			const FVector P(RenderResources->PositionCopy[Idx]);
+			const float Depth = FVector::DotProduct(P - RayOrigin, RayDir);
+			if (Depth <= 0.0f)
+			{
+				continue; // behind the camera
+			}
+			const FVector Closest = RayOrigin + RayDir * Depth;
+			const float DistSq = FVector::DistSquared(P, Closest);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				BestIndex = Idx;
+				BestDepth = Depth;
+			}
+		}
+
+		const float PickRadius = Spacing * GrabPickRadiusScale;
+		if (BestIndex != INDEX_NONE && BestDistSq <= PickRadius * PickRadius)
+		{
+			GrabbedIndex = BestIndex;
+			GrabDepth = BestDepth;
+			bIsGrabbing = true;
+		}
+		else
+		{
+			return; // clicked empty space — nothing grabbed
+		}
+	}
+
+	// While held: keep the target at the picked depth, following the cursor in the view plane.
+	if (bIsGrabbing && GrabbedIndex != INDEX_NONE)
+	{
+		CurrentGrabTarget = RayOrigin + RayDir * GrabDepth;
+	}
 }
 
 void USoftBodyComponent::DrawDebug()

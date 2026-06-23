@@ -1,14 +1,14 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-22 (SB-M2 complete + verified in-editor).
+> Last updated: 2026-06-23 (SB-M3 complete + verified in-editor).
 
 | Milestone | Title | Status |
 |---|---|---|
 | M0 | Project bootstrap (C++ host builds) | ✅ |
 | SB-M1 | GPU lattice solid (framework port + distance constraints) | ✅ |
 | SB-M2 | Volume constraints → jelly (tetrahedra) | ✅ |
-| SB-M3 | Mouse dragging (pick + grab constraint) | ⏳ |
+| SB-M3 | Mouse dragging (pick + grab constraint) | ✅ |
 | SB-M4 | Collisions (ground / sphere / self) | ⏳ |
 | SB-M+ | XPBD compliance, Sphere/SDF shapes, mesh embedding, profiling | ⏳ (stretch) |
 
@@ -40,9 +40,15 @@ Exposed a `VolumeStiffness` [0..1] knob. **Result:** the box keeps its volume �
 back like jelly. The A/B test (VolumeStiffness 0 = SB-M1 flatten, 1 = volume-preserving) is the
 headline demo. The defining "Obi/Zibra-style" behaviour is now in.
 
-### SB-M3 — Mouse dragging ⏳
-Deproject cursor → ray; pick nearest boundary particle (CPU from readback); push grab target; grab
-step pulls it (soft attachment). Interactive poke/pull/stretch.
+### SB-M3 — Mouse dragging ✅ (verified in-editor 2026-06-23)
+Deproject cursor → world ray; on click pick the nearest **boundary** particle in front of the camera
+(CPU, from the position readback) and remember its index + grab depth; while held, the target tracks the
+cursor at that depth. A one-thread `SBGrab.usf` pass pulls the grabbed particle toward the target
+(`lerp(p, target, GrabStiffness)`), run after the constraint solve and before collision so the grab is
+the solver's last word yet still respects the ground; neighbours follow via the constraints (stretchy
+drag), and Finalize gives momentum on release. Cursor enabled at BeginPlay; yellow sphere/line feedback.
+`bEnableMouseDrag` / `GrabStiffness` / `GrabPickRadiusScale` knobs. Reuses the existing readback +
+param-push — no extra GPU readback. Interactive poke/pull/stretch works.
 
 ### SB-M4 — Collisions ⏳
 Port the cloth collision passes: built-in ground plane (already in SB-M1), sphere/capsule colliders,

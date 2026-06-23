@@ -2,7 +2,7 @@
 
 > For a new session/engineer to continue immediately. Assume zero prior context.
 > Update after every milestone — always represents the current state.
-> Last updated: 2026-06-22 (after SB-M2, verified in-editor; SB-M3 is the next task).
+> Last updated: 2026-06-23 (after SB-M3, verified in-editor; SB-M4 is the next task).
 
 ## Project Summary
 From-scratch **GPU soft body simulation in UE 5.7** (no Chaos). Custom compute shaders do
@@ -13,42 +13,51 @@ Host project `SoftBodyDemo`, all real work in `Plugins/SoftBodySim`. Engine: `E:
 (plugin `ClothSim`, M1–M9 complete)** — copy + adapt its files (see the reuse map in `ARCHITECTURE.md`).
 
 ## Current State
-- **M0 + SB-M1 + SB-M2 COMPLETE & verified in-editor.** The `SoftBodySim` plugin runs a full
-  volume-preserving GPU soft body: a tetrahedral lattice box falls, squashes, and **bulges back to its
-  rest volume** (jelly), resting on the built-in ground plane; rendered as a lit two-sided mesh. Builds
-  clean via the CLI command below. Pushed to `main`.
+- **M0 + SB-M1 + SB-M2 + SB-M3 COMPLETE & verified in-editor.** The `SoftBodySim` plugin runs a full
+  volume-preserving GPU soft body that is **interactively draggable**: a tetrahedral lattice box falls,
+  squashes, bulges back to its rest volume (jelly), rests on the ground, and can be grabbed and pulled
+  with the mouse. Rendered as a lit two-sided mesh. Builds clean via the CLI command below. Pushed to `main`.
 - **What exists** (all in `Plugins/SoftBodySim`): plugin/module (`/SoftBodySim`→`Shaders/`),
-  `SoftBodyResources.h` (params + `FGPUConstraint` + `FGPUVolumeConstraint` + `FSoftBodyTet` + resources),
-  5 shaders (`SBPredict`/`SBSolveDistance`/**`SBSolveVolume`**/`SBCollision`/`SBFinalize`),
-  `SoftBodyCompute.cpp` (RDG: Predict → per iter {distance colors; volume colors} → ground collision →
-  Finalize → readback), `USoftBodyComponent` (centered box lattice, **6-tet Kuhn split → `Tets`**, distance
-  constraints from tet edges + greedy coloring, **per-tet volume constraints + tet coloring**, boundary
-  surface, fixed-step dispatch, readback→verts), `FSoftBodyMeshSceneProxy`, `ASoftBodyActor`.
-  Demo: `Content/M_Softbody` (two-sided material) + a SoftBody actor in `LV_Demo`.
+  `SoftBodyResources.h` (params + `FGPUConstraint` + `FGPUVolumeConstraint` + `FGPUCollider` + `FSoftBodyTet`
+  + resources), 6 shaders (`SBPredict`/`SBSolveDistance`/`SBSolveVolume`/**`SBGrab`**/`SBCollision`/`SBFinalize`),
+  `SoftBodyCompute.cpp` (RDG: Predict → per iter {distance colors; volume colors} → [grab] → ground collision
+  → Finalize → readback), `USoftBodyComponent` (centered box lattice, **6-tet Kuhn split → `Tets`**, distance
+  constraints from tet edges + greedy coloring, per-tet volume constraints + tet coloring, boundary surface,
+  **`BoundaryParticles` + `UpdateMouseGrab`**, fixed-step dispatch, readback→verts), `FSoftBodyMeshSceneProxy`,
+  `ASoftBodyActor`. Demo: `Content/M_Softbody` (two-sided material) + a SoftBody actor in `LV_Demo`.
 - **Key knobs:** `VolumeStiffness` (0 = SB-M1 flatten, 1 = jelly), `Stiffness`, `Substeps`, `SolverIterations`,
-  `Anchor` (None/Top/Bottom face), `bGroundPlane`/`GroundHeight`, `bShowStats`/`bDrawDebugPoints`.
-- **No mouse interaction yet** — that's SB-M3.
+  `Anchor` (None/Top/Bottom face), `bGroundPlane`/`GroundHeight`, `bEnableMouseDrag`/`GrabStiffness`/
+  `GrabPickRadiusScale`, `bShowStats`/`bDrawDebugPoints`.
+- **Collisions are ground-plane only** — sphere/capsule colliders + self-collision are SB-M4.
 
-## Immediate Next Task — SB-M3: mouse dragging
-Let the user poke/pull/stretch the body with the cursor. Reuses the existing position readback + per-frame
-param-push pattern; **no extra GPU readback needed**. Suggested approach:
-1. **Pick (game thread, on click):** `APlayerController::DeprojectMousePositionToWorld` → world ray. Using
-   the latest `RenderResources->PositionCopy` (world-space, guarded by `PositionCopyCS`), find the nearest
-   **boundary** particle to the ray (smallest point-to-ray distance). Remember its particle index + the grab
-   depth (distance along the ray to that particle). Store on the component.
-2. **Drag (each frame while held):** target world pos = ray origin + dir * grabDepth (recompute the ray from
-   the current cursor). Add to `FSoftBodyParams` a `bool bGrabActive; int32 GrabIndex; FVector3f GrabTarget;
-   float GrabStiffness;` and push them in `TickComponent`.
-3. **Grab solve (GPU):** add a tiny pass (or fold into Finalize/Predict) that pulls particle `GrabIndex`
-   toward `GrabTarget`: `p += GrabStiffness * (GrabTarget - p)` on the predicted buffer (a soft attachment),
-   or temporarily set its InvMass to 0 and hard-set its predicted position to the target (firm pin). A new
-   `SBGrab.usf` single-thread dispatch keyed on `GrabIndex` is cleanest; bind it after the constraint solve,
-   before collision, so the grabbed vertex still respects the ground.
-4. **Input:** simplest is to poll in `TickComponent` via the owning `APlayerController` (mouse button +
-   `DeprojectMousePositionToWorld`), so no input-binding setup is needed in the demo map. Enable the cursor.
-- **Verify:** click-drag a face/corner and the jelly follows the cursor, stretching and wobbling; release and
-  it springs back. **Do not commit/update docs until the user confirms in-editor.**
-- Then SB-M4 (sphere/capsule colliders + spatial-hash self-collision — port the cloth passes). See `ROADMAP.md`.
+## Immediate Next Task — SB-M4: collisions (sphere/capsule + self)
+Port the remaining cloth collision passes so the jelly collides with shapes and with itself. The
+`SBCollision.usf` shader **already has the full capsule routine + a world-space `FGPUCollider` buffer path**
+(carried over in SB-M1) — the analytic-collider half is mostly wiring + authoring UI. Steps:
+1. **Authored colliders (component):** add a `USTRUCT FSoftBodyCollider { EType Sphere/Capsule; FVector Center;
+   float Radius; float HalfHeight; FRotator Rotation; }` + a `TArray<FSoftBodyCollider> Colliders` UPROPERTY
+   (mirror cloth `FClothCollider`). In `TickComponent`, transform each to world space and fill
+   `Params.Colliders` (sphere → A==B; capsule → A/B = center ± axis*halfHeight), exactly like
+   `UClothSimComponent::TickComponent`. The dispatch already binds `Params.Colliders` and passes `NumColliders`
+   to `SBCollision.usf`, so this should light up with no shader change. Add optional `DrawDebug` wireframes.
+2. **Self-collision (port cloth):** copy `ClothBuildGrid.usf` + `ClothSelfCollision.usf` → `SBBuildGrid.usf` +
+   `SBSelfCollision.usf` (spatial-hash broadphase + Jacobi repulsion). Add `FSBBuildGridCS`/`FSBSelfCollisionCS`
+   classes (copy from `ClothSimCompute.cpp`, incl. the `NextPrime`/`kMaxPerCell` helpers) and the per-substep
+   build+respond passes (after the solve, before/with collision), ping-ponging a scratch buffer. NOTE: cloth's
+   self-collision excludes *grid* 1-ring neighbours; for the soft body the natural exclusion is **lattice
+   1-ring** (|dx|,|dy|,|dz| ≤ 1) — adapt the neighbour test. Gate behind a `bSelfCollision` UPROPERTY +
+   `SelfThickness`/`SelfStiffness`/`SelfIterations` params (mirror cloth).
+3. Reuse `Params.Friction`, the dummy-collider-when-ground-only path, and the `kThreadGroupSize`/`NextPrime`
+   sizing already proven in cloth.
+- **Verify:** drop the jelly onto a sphere/capsule (it drapes/squashes around it); enable self-collision and
+  fold/compress it so layers don't interpenetrate. **Do not commit/update docs until the user confirms in-editor.**
+- After SB-M4 the core feature set (Obi/Zibra-style) is complete; remaining work is the SB-M+ stretch list.
+
+## Cloth reuse pointers for SB-M4 (from RT_ClothSim)
+- `Plugins/ClothSim/Shaders/Private/ClothCollision.usf` — already ported as `SBCollision.usf` (capsule + ground).
+- `Plugins/ClothSim/Shaders/Private/ClothBuildGrid.usf`, `ClothSelfCollision.usf` — copy → `SB*` (spatial-hash self-collision).
+- `Plugins/ClothSim/Source/ClothSim/Private/ClothSimCompute.cpp` — `FClothBuildGridCS`/`FClothSelfCollisionCS` classes, `NextPrime`, `kMaxPerCell`, and the build+respond dispatch loop to copy.
+- `Plugins/ClothSim/Source/ClothSim/Private/ClothSimComponent.cpp` — `FClothCollider` struct, the world-space collider build in `TickComponent`, and `DrawColliders`.
 
 ## Inherited gotchas confirmed so far
 - A `TArray<T>` **value member** in a `UCLASS` header needs the COMPLETE type `T` (not a forward declaration)
@@ -57,6 +66,8 @@ param-push pattern; **no extra GPU readback needed**. Suggested approach:
 - GPU constraint structs use a **tight scalar layout** that must match between C++ and HLSL (e.g.
   `FGPUVolumeConstraint` = 4×uint + 2×float = 24 B). Structured buffers pack tightly; the 16-byte-alignment
   trap is constant-buffer-only. `Cross(E2,E1)` normals + two-sided material; `RDG_EVENT_NAME` only (no breadcrumb scopes).
+- The **plugin links independently of the host module**: using `EKeys` (mouse input) required adding
+  `InputCore` to the *plugin's* `Build.cs` even though the host game module already depended on it (SB-M3).
 
 ## How to Build & Run
 **Close the SoftBodyDemo editor first** (Live Coding globally locks builds), then:
@@ -85,10 +96,10 @@ gotchas in `WORKFLOW.md`.
 > "Read `Docs/HANDOFF.md`, `Docs/PROJECT_STATE.md`, `Docs/ARCHITECTURE.md`, and `Docs/WORKFLOW.md` to
 > load context. This is a from-scratch GPU **soft body** sim in UE 5.7 (host `SoftBodyDemo`, plugin
 > `SoftBodySim`), reusing the framework from the sibling cloth project at `E:\ClaudeCode\RT_ClothSim`
-> (plugin `ClothSim`). M0 + SB-M1 (GPU lattice solid) + SB-M2 (volume-preserving jelly) are done and
-> verified. Implement the milestone under 'Immediate Next Task' (SB-M3: mouse dragging), following
-> `WORKFLOW.md`: build via the CLI command in HANDOFF with the editor closed, then WAIT for me to verify
-> in-editor before updating docs or committing.
+> (plugin `ClothSim`). M0 + SB-M1 (GPU lattice solid) + SB-M2 (volume-preserving jelly) + SB-M3 (mouse
+> dragging) are done and verified. Implement the milestone under 'Immediate Next Task' (SB-M4: sphere/capsule
+> colliders + spatial-hash self-collision), following `WORKFLOW.md`: build via the CLI command in HANDOFF
+> with the editor closed, then WAIT for me to verify in-editor before updating docs or committing.
 > Update PROJECT_STATE/ROADMAP/DEVLOG/HANDOFF/PORTFOLIO_NOTES (+ARCHITECTURE if it changes) per
 > milestone. Port/adapt cloth files per the reuse map in ARCHITECTURE.md; apply the inherited
 > gotchas (Cross(E2,E1) normals; no RHI breadcrumb scopes) from the start. Git remote:

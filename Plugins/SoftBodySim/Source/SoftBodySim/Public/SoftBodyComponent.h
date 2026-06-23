@@ -122,6 +122,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "1", ClampMax = "8"))
 	int32 MaxStepsPerFrame = 4;
 
+	/**
+	 * Left-click and drag to grab the nearest surface point and pull the body around
+	 * (SB-M3). Enables the mouse cursor at BeginPlay. Picking + dragging are CPU-side
+	 * (from the position readback); a GPU pass pulls the grabbed particle to the cursor.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction")
+	bool bEnableMouseDrag = true;
+
+	/** Firmness of the grab [0..1]: 1 = the grabbed point snaps to the cursor, lower = softer/laggier. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float GrabStiffness = 0.8f;
+
+	/** How close (in multiples of Spacing) the click ray must pass to a surface particle to grab it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.25"))
+	float GrabPickRadiusScale = 1.5f;
+
 	/** Material applied to the soft body. Use a TWO-SIDED material to light both faces. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Render")
 	TObjectPtr<UMaterialInterface> SoftBodyMaterial = nullptr;
@@ -178,6 +194,11 @@ private:
 	 *  and push the updated vertices to the scene proxy. */
 	void UpdateMeshFromSimulation();
 
+	/** Poll the mouse: on click pick the nearest boundary particle to the cursor ray (CPU,
+	 *  from the readback) and remember it + its grab depth; while held, track the world-space
+	 *  cursor target at that depth. Updates the grab state read by TickComponent (SB-M3). */
+	void UpdateMouseGrab();
+
 	/** Draw readback positions as debug points (optional). */
 	void DrawDebug();
 
@@ -200,6 +221,15 @@ private:
 	// Initial local-space positions (corner at component origin); used to seed the proxy
 	// and to orient the boundary triangle winding.
 	TArray<FVector3f> InitialLocalPositions;
+
+	// Unique lattice indices on the box surface (the only ones the mouse can grab).
+	TArray<int32> BoundaryParticles;
+
+	// Mouse grab state (SB-M3). GrabbedIndex == INDEX_NONE when not grabbing.
+	int32   GrabbedIndex = INDEX_NONE;
+	float   GrabDepth = 0.0f;            // distance along the click ray to the grabbed point
+	bool    bIsGrabbing = false;
+	FVector CurrentGrabTarget = FVector::ZeroVector; // world space
 
 	// Scratch reused each frame for the proxy update (local space).
 	TArray<FVector3f> LocalPositions;

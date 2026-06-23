@@ -1,0 +1,30 @@
+// SBGrab.usf
+//
+// Mouse-drag grab (SB-M3). A single thread pulls one grabbed particle toward the
+// cursor's world-space target. Runs once per substep AFTER the constraint solve and
+// BEFORE collision, so the grabbed vertex is the solver's last word (and still gets
+// projected out of the ground). Neighbours follow over subsequent substeps via the
+// distance/volume constraints, giving a stretchy drag. Finalize derives velocity from
+// the position change, so the body keeps momentum when released.
+//
+// GrabStiffness near 1 = the vertex snaps to the cursor (firm pin); lower = a softer,
+// laggier attachment.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+RWStructuredBuffer<float3>	PredictedPositions;	// in/out (solved positions)
+
+uint	GrabIndex;		// particle to pull
+float3	GrabTarget;		// world-space cursor target
+float	GrabStiffness;	// [0,1] how hard to pull toward the target this substep
+
+[numthreads(1, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const float3 P = PredictedPositions[GrabIndex];
+	PredictedPositions[GrabIndex] = lerp(P, GrabTarget, saturate(GrabStiffness));
+}

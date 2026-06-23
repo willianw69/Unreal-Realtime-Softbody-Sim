@@ -1,18 +1,19 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-22 (SB-M1 + SB-M2 implemented + verified — the pipeline below is real,
-> including both the distance and volume constraint sets).
+> Last updated: 2026-06-23 (SB-M1–M3 implemented + verified — distance + volume constraints, plus
+> interactive mouse-drag grab).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
-**Status note (through SB-M2):** everything below is implemented. The lattice, the **6-tet Kuhn
+**Status note (through SB-M3):** everything below is implemented. The lattice, the **6-tet Kuhn
 decomposition** (`USoftBodyComponent::BuildTets`), the **distance** constraints from unique tet edges,
-the **per-tet volume** constraints (`SBSolveVolume.usf`, second graph-colored set), the boundary
-surface, the `SBPredict → [colored-GS distance + colored-GS volume]×iters → SBCollision (ground) →
-SBFinalize → readback` pipeline, and the `FSoftBodyMeshSceneProxy` render path all exist and run.
-The "PredictedA/B ping-pong" row below is a single in-place `Predicted` buffer in practice (both colored
-solves and the collision pass write in place, so no ping-pong is needed). Not yet done: mouse drag
-(SB-M3), sphere/capsule + self-collision (SB-M4).
+the **per-tet volume** constraints (`SBSolveVolume.usf`, second graph-colored set), the **mouse-drag grab**
+(`SBGrab.usf`, pulls the picked particle after the solve / before collision; pick is CPU from the
+readback), the boundary surface, the `SBPredict → [colored-GS distance + colored-GS volume]×iters →
+[SBGrab] → SBCollision (ground) → SBFinalize → readback` pipeline, and the `FSoftBodyMeshSceneProxy`
+render path all exist and run. The "PredictedA/B ping-pong" row below is a single in-place `Predicted`
+buffer in practice (the colored solves, grab, and collision all write in place). Not yet done:
+sphere/capsule + self-collision (SB-M4).
 
 ## High-Level Architecture (intended, mirrors ClothSim)
 

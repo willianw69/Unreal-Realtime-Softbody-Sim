@@ -12,7 +12,8 @@ public class SoftBodySim : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
-			"Engine"
+			"Engine",
+			"InputCore"   // EKeys (mouse-drag picking, SB-M3)
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]

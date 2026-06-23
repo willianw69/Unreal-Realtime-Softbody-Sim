@@ -106,4 +106,40 @@ readback, push a grab target to the render thread, pull that particle (soft atta
 
 ---
 
-<!-- Append SB-M3, SB-M4, … entries below after each milestone is implemented + verified in-editor. -->
+## 2026-06-23 — SB-M3: mouse dragging
+**What:** Made the soft body interactive — left-click and drag to poke/pull/stretch it. New shader
+`SBGrab.usf` (+ `FSBGrabCS`): a single GPU thread pulls the grabbed particle toward a world-space cursor
+target, `PredictedPositions[GrabIndex] = lerp(P, GrabTarget, saturate(GrabStiffness))`. Added grab fields
+to `FSoftBodyParams` (`bGrabActive`, `GrabIndex`, `GrabTarget`, `GrabStiffness`). The dispatch runs the
+grab pass AFTER the distance+volume solve and BEFORE collision, so the grabbed vertex is the solver's last
+word yet is still projected out of the ground; neighbours follow via the constraints over substeps, and
+Finalize (`v=(p−x)/dt`) gives momentum on release.
+
+CPU side (`USoftBodyComponent::UpdateMouseGrab`, called from Tick): build a `BoundaryParticles` list (any
+lattice particle on a box face) once at init; on left-mouse-down deproject the cursor
+(`DeprojectMousePositionToWorld`) to a world ray and pick the boundary particle with the smallest
+point-to-ray distance that's in front of the camera (within `GrabPickRadiusScale * Spacing`), remembering
+its index + grab depth (`dot(P−rayO, rayDir)`); while held, the target = `rayO + rayDir * depth` (follows
+the cursor in the view plane at the picked depth); on release, clear the grab. Cursor enabled at BeginPlay.
+Yellow debug sphere at the target + line to the grabbed particle. Props: `bEnableMouseDrag`,
+`GrabStiffness`, `GrabPickRadiusScale`.
+
+**Why:** Interactive dragging is a stated project requirement and the best way to *show* the volume
+preservation — you can stretch the jelly and watch it recoil. Reuses the existing position readback (for
+picking) and the per-frame param-push (for the target), so no new GPU→CPU traffic was needed.
+
+**Problems & solutions:** Link error `LNK2019: EKeys::LeftMouseButton` — `EKeys` lives in the **InputCore**
+module, which the plugin didn't depend on (the host module did, but not the plugin). Fix: add `InputCore`
+to `PublicDependencyModuleNames` in `SoftBodySim.Build.cs`. Otherwise compiled + ran cleanly.
+
+**Performance:** Picking is CPU brute-force over the boundary particles (the surface subset, not all
+particles) — trivial at demo resolutions; would want a spatial structure only at very high res. The grab
+pass is one thread.
+
+**Next:** SB-M4 — collisions: sphere/capsule colliders (Details-panel authored → `FGPUCollider` buffer;
+`SBCollision.usf` already has the capsule routine) + GPU spatial-hash self-collision (port cloth
+`ClothBuildGrid`/`ClothSelfCollision`).
+
+---
+
+<!-- Append SB-M4, SB-M5, … entries below after each milestone is implemented + verified in-editor. -->

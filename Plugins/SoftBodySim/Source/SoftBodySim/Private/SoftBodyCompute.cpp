@@ -101,6 +101,31 @@ public:
 	}
 };
 
+// Mouse-drag grab: a single thread pulls one grabbed particle toward the cursor (SB-M3).
+class FSBGrabCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBGrabCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBGrabCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, PredictedPositions)
+		SHADER_PARAMETER(uint32, GrabIndex)
+		SHADER_PARAMETER(FVector3f, GrabTarget)
+		SHADER_PARAMETER(float, GrabStiffness)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+	}
+};
+
 class FSBCollisionCS : public FGlobalShader
 {
 public:
@@ -160,6 +185,7 @@ public:
 IMPLEMENT_GLOBAL_SHADER(FSBPredictCS,       "/SoftBodySim/Private/SBPredict.usf",       "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveDistanceCS, "/SoftBodySim/Private/SBSolveDistance.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSolveVolumeCS,   "/SoftBodySim/Private/SBSolveVolume.usf",   "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBGrabCS,          "/SoftBodySim/Private/SBGrab.usf",          "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionCS,     "/SoftBodySim/Private/SBCollision.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBFinalizeCS,      "/SoftBodySim/Private/SBFinalize.usf",      "MainCS", SF_Compute);
 
@@ -348,8 +374,13 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	TShaderMapRef<FSBPredictCS>       PredictCS(ShaderMap);
 	TShaderMapRef<FSBSolveDistanceCS> SolveCS(ShaderMap);
 	TShaderMapRef<FSBSolveVolumeCS>   VolumeCS(ShaderMap);
+	TShaderMapRef<FSBGrabCS>          GrabCS(ShaderMap);
 	TShaderMapRef<FSBCollisionCS>     CollisionCS(ShaderMap);
 	TShaderMapRef<FSBFinalizeCS>      FinalizeCS(ShaderMap);
+
+	const bool bDoGrab = Params.bGrabActive
+		&& Params.GrabIndex >= 0
+		&& Params.GrabIndex < Num;
 
 	if (SubDt > 0.0f)
 	{
@@ -428,6 +459,22 @@ void SoftBodyCompute::Dispatch_RenderThread(
 							VolumeCS, P, FComputeShaderUtils::GetGroupCount(Range.Count, kThreadGroupSize));
 					}
 				}
+			}
+
+			// --- Grab: pull the mouse-grabbed particle toward the cursor target ---
+			// After the solve (so it's the last word on that vertex), before collision (so
+			// it still can't be dragged through the ground).
+			if (bDoGrab)
+			{
+				FSBGrabCS::FParameters* P = GraphBuilder.AllocParameters<FSBGrabCS::FParameters>();
+				P->PredictedPositions = GraphBuilder.CreateUAV(Predicted);
+				P->GrabIndex          = (uint32)Params.GrabIndex;
+				P->GrabTarget         = Params.GrabTarget;
+				P->GrabStiffness      = Params.GrabStiffness;
+
+				FComputeShaderUtils::AddPass(GraphBuilder,
+					RDG_EVENT_NAME("SBGrab (substep %d)", Step),
+					GrabCS, P, FIntVector(1, 1, 1));
 			}
 
 			// --- Collision: project predicted positions out of colliders + ground ---

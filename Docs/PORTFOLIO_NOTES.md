@@ -96,4 +96,25 @@ framework generalizes across constraint types.
 Based Dynamics volume constraints, graph-colored for race-free parallel solving, layered onto a shared
 colored-Gauss-Seidel framework also driving a cloth simulator."
 
-<!-- Append SB-M3, SB-M4, … sections below as milestones are completed. -->
+## SB-M3 — Mouse dragging ✅ 2026-06-23
+**Shipped:** Real-time interactive dragging of the GPU-simulated body — click any surface point and pull
+it around; the jelly stretches, follows, and springs back with momentum. The interaction that makes the
+volume preservation *tangible* in a demo.
+
+**Talking points proven in M3:**
+- **Screen-space picking against GPU-driven geometry:** deproject the cursor to a world ray and pick the
+  nearest *surface* particle from the same non-stalling position readback that feeds rendering — no extra
+  GPU→CPU traffic, no separate pick buffer. A clean example of reusing existing data flow.
+- **A grab as just another constraint:** the grabbed particle is pulled toward the cursor by a one-thread
+  GPU pass placed after the constraint solve and before collision, so it's the solver's last word but
+  still can't be dragged through the floor. The body follows because the distance/volume constraints
+  propagate the displacement over substeps — emergent stretchiness, not hand-animated.
+- **Momentum for free from PBD:** because velocity is re-derived from the position delta in Finalize, a
+  released grab carries the velocity the drag imparted — fling-and-recoil with no extra bookkeeping.
+- **Game/render thread split holds up under interaction:** input + picking on the game thread, the grab
+  target pushed through the existing per-frame param snapshot, all sim math still on the render thread.
+
+**Engineering note:** linker surfaced that `EKeys` lives in `InputCore` — the plugin needed that module
+dependency even though the host game module already had it (plugin and host link independently).
+
+<!-- Append SB-M4, SB-M5, … sections below as milestones are completed. -->

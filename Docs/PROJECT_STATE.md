@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 > Single source of truth for current project status. Update after every milestone.
-> Last updated: 2026-06-22 (SB-M2 complete + verified in-editor; SB-M3 is next).
+> Last updated: 2026-06-23 (SB-M3 complete + verified in-editor; SB-M4 is next).
 
 ## Project Overview
 Real-time **GPU soft body simulation built from scratch** in **Unreal Engine 5.7**, as a
@@ -24,10 +24,10 @@ constraints** · **mouse dragging** · **volume preservation (jelly)** · UE 5.7
 similar to Obi/Zibra soft body.
 
 ## Current Milestone
-**SB-M2 — Volume constraints → jelly: COMPLETE + verified in-editor (2026-06-22).** Per-tet volume
-constraints now run as a second graph-colored constraint set, so the box preserves its volume —
-squashes and bulges back like jelly (the defining Obi/Zibra-style behaviour). A `VolumeStiffness`
-knob drives the effect (0 = SB-M1 flatten, 1 = volume-preserving). The headline feature is in.
+**SB-M3 — Mouse dragging: COMPLETE + verified in-editor (2026-06-23).** Left-click and drag pokes,
+pulls, and stretches the jelly: CPU picks the nearest surface particle to the cursor ray (from the
+readback), a one-thread GPU grab pass pulls it toward the cursor each substep, and the rest of the
+body follows via the constraints. Springs back with momentum on release. The sim is now interactive.
 
 ## Completed Milestones
 - **M0 — Bootstrap.** UE 5.7 C++ host project `SoftBodyDemo` (BuildSettings V6, DX12,
@@ -44,12 +44,18 @@ knob drives the effect (0 = SB-M1 flatten, 1 = volume-preserving). The headline 
   volume) and greedily colors the tets (conflict = shared vertex). The substep solve interleaves
   distance colors then volume colors each iteration. `VolumeStiffness` param + `FGPUVolumeConstraint`
   struct. Volume-preserving jelly verified in-editor.
+- **SB-M3 — Mouse dragging.** Added `SBGrab.usf` + `FSBGrabCS` (one-thread pull of the grabbed particle)
+  and grab fields on `FSoftBodyParams`. `USoftBodyComponent::UpdateMouseGrab` deprojects the cursor,
+  picks the nearest boundary particle (built `BoundaryParticles` list) from the readback, tracks the
+  target depth, and pushes it to the grab pass (after solve, before collision). Cursor enabled at
+  BeginPlay; `bEnableMouseDrag`/`GrabStiffness`/`GrabPickRadiusScale` props; added `InputCore` dep
+  (EKeys). Interactive drag verified in-editor.
 
 ## Next Milestone
-**SB-M3 — Mouse dragging.** Deproject the cursor to a world ray; pick the nearest **boundary** particle
-(CPU, from the position readback) and remember its index + grab depth; each frame push
-`{grabbedIndex, targetWorldPos}` to the render thread and pull that particle toward the target (soft
-attachment / temporary pin). Reuses the existing readback + param-push pattern. See `ROADMAP.md`/`HANDOFF.md`.
+**SB-M4 — Collisions.** Port the cloth collision passes beyond the existing ground plane: sphere/capsule
+colliders (authored in the Details panel → world-space `FGPUCollider` buffer → `SBCollision.usf`, which
+already has the capsule routine) and GPU spatial-hash **self-collision** (`SBBuildGrid`/`SBSelfCollision`
+ported from cloth) so the jelly squashes against shapes and against itself. See `ROADMAP.md`/`HANDOFF.md`.
 
 ## Technical Decisions
 - **Method:** tetrahedral XPBD — a particle lattice filled with tetrahedra; solve **distance**
@@ -69,7 +75,9 @@ attachment / temporary pin). Reuses the existing readback + param-push pattern. 
 ## Known Limitations / Notes (planned)
 - Volume preservation is PBD (iteration-dependent stiffness), not XPBD compliance — very high
   `VolumeStiffness` + low Substeps can jitter; the fix is more Substeps (or XPBD λ, a stretch goal).
-- No mouse interaction yet (SB-M3); collisions are ground-plane only so far (sphere/capsule + self in SB-M4).
+- Collisions are ground-plane only so far (sphere/capsule + self in SB-M4).
+- Mouse drag picks/moves in the camera view plane at the grab depth (no toward/away-camera pull); CPU
+  brute-force nearest-particle pick over the boundary list (fine at demo resolutions).
 - Point-based collisions (SB-M4) reuse cloth and are not continuous (no CCD).
 - Surface rendering is the lattice boundary; embedding a smooth render mesh skinned to tets is a
   later upgrade.

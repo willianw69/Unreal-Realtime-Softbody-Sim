@@ -90,6 +90,12 @@ struct FSoftBodyParams
 	float   Stiffness = 1.0f;      // [0,1] global distance-correction scale
 	float   VolumeStiffness = 1.0f;// [0,1] per-tet volume-correction scale (SB-M2)
 
+	// Mouse drag (SB-M3) — pull one grabbed particle toward a world-space cursor target.
+	bool      bGrabActive = false;
+	int32     GrabIndex = -1;
+	FVector3f GrabTarget = FVector3f::ZeroVector;
+	float     GrabStiffness = 0.8f; // [0,1] firmness of the attachment
+
 	// Collision — world-space colliders rebuilt each frame (SB-M4); empty for SB-M1.
 	TArray<FGPUCollider> Colliders;
 	float   Friction = 0.3f;
