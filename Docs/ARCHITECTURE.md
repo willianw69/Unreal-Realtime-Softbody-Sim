@@ -1,8 +1,7 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-23 (SB-M1–M7 implemented + verified — constraints, grab, collisions, custom-mesh
-> embedding, weight-painted stiffness, XPBD distance solve).
+> Last updated: 2026-06-23 (SB-M1–M8 — adds Global-Distance-Field collision + dynamic render bounds).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
 **Status note (through SB-M7):** the SB-M1–M4 core (lattice, 6-tet Kuhn split, distance + per-tet volume
@@ -16,14 +15,20 @@ render) is all implemented, plus three additions:
   (`BuildParticleWeights`) → per-constraint softness.
 - **XPBD distance solve (SB-M7):** `SBSolveDistanceXPBD.usf` with per-constraint compliance + a λ accumulator
   (reset per substep); `bUseXPBD` toggle; compliance 0 ≡ stiff PBD. Volume solve stays PBD.
+- **Distance-field collision (SB-M8):** `FSoftBodySceneViewExtension` snapshots the scene Global Distance
+  Field each frame (render-thread cache `SoftBodyGDF::Get`); `SBCollisionDF.usf` (`FSBCollisionDFCS`) samples
+  it per particle and projects out, additive with the analytic colliders. Needs `r.GenerateMeshDistanceFields`.
+- **Dynamic render bounds (SB-M8 fix):** the component recomputes `LocalBounds` from the deformed verts each
+  frame and pushes them to the render thread (`UpdateBounds` + `MarkRenderTransformDirty`) so the body isn't
+  frustum-culled when it travels far from the actor.
 
 Actual per-substep pipeline:
 `SBPredict → [colored-GS distance (XPBD or PBD) + colored-GS volume]×iters → [self-collision build+respond
-×iters, ping-pong] → [SBGrab] → SBCollision (shapes + ground) → SBFinalize → readback`. The "PredictedA/B
-ping-pong" row below is real: the colored solves/grab/collision write in place on `PredictedA`, and
-self-collision ping-pongs `PredictedA`↔`PredictedB` (a `Solved` ref tracks the current buffer). Remaining
-items are the SB-M+ stretch list (SDF/non-box cage shapes, XPBD volume, render-mesh skinning upgrade,
-multiple bodies, profiling).
+×iters, ping-pong] → [SBGrab] → SBCollision (shapes + ground) → [SBCollisionDF] → SBFinalize → readback`.
+The "PredictedA/B ping-pong" row below is real: the colored solves/grab/collision write in place on
+`PredictedA`, and self-collision ping-pongs `PredictedA`↔`PredictedB` (a `Solved` ref tracks the current
+buffer). Remaining items are the SB-M+ stretch list (per-mesh/custom SDF colliders, conforming cage, XPBD
+volume, render-mesh skinning upgrade, multiple bodies, profiling).
 
 ## High-Level Architecture (intended, mirrors ClothSim)
 

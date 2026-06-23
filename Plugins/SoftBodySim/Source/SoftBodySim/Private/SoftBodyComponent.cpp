@@ -3,6 +3,7 @@
 #include "SoftBodyComponent.h"
 #include "SoftBodyResources.h"
 #include "SoftBodyMeshProxy.h"
+#include "SoftBodySceneViewExtension.h"     // GDF snapshot registration (SB-M8)
 
 #include "DrawDebugHelpers.h"
 #include "DynamicMeshBuilder.h"            // FDynamicMeshVertex
@@ -31,6 +32,9 @@ USoftBodyComponent::USoftBodyComponent()
 void USoftBodyComponent::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// Register the view extension that snapshots the Global Distance Field (SB-M8).
+	SoftBodyGDF::EnsureRegistered();
 
 	InitializeSimulation();
 
@@ -630,9 +634,9 @@ float USoftBodyComponent::WeightToStiffScale(float Weight) const
 
 void USoftBodyComponent::InitializeSimulation()
 {
-	ResX = FMath::Clamp(ResX, 2, 32);
-	ResY = FMath::Clamp(ResY, 2, 32);
-	ResZ = FMath::Clamp(ResZ, 2, 32);
+	ResX = FMath::Clamp(ResX, 2, 64);
+	ResY = FMath::Clamp(ResY, 2, 64);
+	ResZ = FMath::Clamp(ResZ, 2, 64);
 	NumParticles = ResX * ResY * ResZ;
 
 	// Surface particles (any on a face of the box) — the only ones the mouse can grab.
@@ -886,6 +890,10 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	Params.bGroundPlane     = bGroundPlane;
 	Params.GroundZ          = GroundHeight;
 
+	// Distance-field collision (SB-M8).
+	Params.bUseDistanceFieldCollision = bUseDistanceFieldCollision;
+	Params.DFThickness                = DistanceFieldThickness;
+
 	// Self-collision (SB-M4).
 	Params.bSelfCollision          = bSelfCollision;
 	Params.SelfThickness           = SelfCollisionScale * EffectiveSpacing;
@@ -987,6 +995,18 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 				NumConstraintsBuilt, NumColorsBuilt, NumVolumeConstraintsBuilt, NumVolumeColorsBuilt,
 				Substeps, SolverIterations, SolveDispatches));
 	}
+
+	// SB-M8 diagnostic: report whether the Global Distance Field snapshot is reaching us.
+	if (bUseDistanceFieldCollision && GEngine)
+	{
+		const FSoftBodyGDFCache& Cache = SoftBodyGDF::Get();
+		GEngine->AddOnScreenDebugMessage(
+			(uint64)(UPTRINT)this + 3, 0.0f,
+			Cache.bValid ? FColor::Green : FColor::Red,
+			FString::Printf(TEXT("SoftBody GDF: valid=%d  clipmaps=%d  (needs 'Generate Mesh Distance Fields')"),
+				Cache.bValid ? 1 : 0,
+				Cache.bValid ? Cache.Data.NumGlobalSDFClipmaps : 0));
+	}
 }
 
 void USoftBodyComponent::ComputeNormalsTangents(
@@ -1041,7 +1061,9 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 		return;
 	}
 
-	// Copy the latest world-space positions out of the readback buffer, to local space.
+	// Copy the latest world-space positions out of the readback buffer, to local space,
+	// and track their local-space bounding box this frame.
+	FBox LocalBox(ForceInit);
 	{
 		FScopeLock Lock(&RenderResources->PositionCopyCS);
 		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles)
@@ -1055,8 +1077,16 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 		{
 			const FVector World(RenderResources->PositionCopy[i]);
 			LocalPositions[i] = FVector3f(WorldToLocal.TransformPosition(World));
+			LocalBox += FVector(LocalPositions[i]);
 		}
 	}
+
+	// Bounds follow the deformed body so it isn't frustum-culled (vanishing) once it falls /
+	// is dragged / pushed far from the actor origin. The cage encloses the embedded mesh, so
+	// the cage's box covers the rendered mesh too. Push the new bounds to the render thread.
+	LocalBounds = FBoxSphereBounds(LocalBox.ExpandBy(EffectiveSpacing));
+	UpdateBounds();
+	MarkRenderTransformDirty();
 
 	if (bMeshMode)
 	{

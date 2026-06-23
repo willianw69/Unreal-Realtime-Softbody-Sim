@@ -1,0 +1,71 @@
+// SBCollisionDF.usf
+//
+// SB-M8: collide the soft body against ANY scene mesh using Unreal's Global Distance
+// Field. The GDF is a scene-wide signed distance field; sampling it gives the distance
+// to the nearest surface and (via the gradient) the direction to push out. One field
+// sample replaces all per-shape collision math and works against arbitrary geometry
+// (any mesh with "Generate Mesh Distance Fields" enabled).
+//
+// Sampling is done in TRANSLATED world space (world + PreViewTranslation), which is what
+// the engine's GDF helpers expect. The GDF shader parameters are bound from
+// FGlobalDistanceFieldParameters2 (the non-material / standalone path of the shared
+// header, selected because IS_MATERIAL_SHADER is not defined here).
+//
+// Ported verbatim from ClothCollisionDF.usf — the GDF sample is topology-agnostic.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DistanceField/GlobalDistanceFieldShared.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+RWStructuredBuffer<float3>	PredictedPositions;	// in/out
+StructuredBuffer<float3>	PrevPositions;
+StructuredBuffer<float>		InvMasses;
+
+uint	NumParticles;
+float3	PreViewTranslation;
+float	Thickness;	// keep the body this far off surfaces (cm)
+float	Friction;	// [0..1] tangential damping on contact
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+	if (InvMasses[Index] <= 0.0f)
+	{
+		return; // pinned
+	}
+
+	float3 P = PredictedPositions[Index];
+	const float3 Prev = PrevPositions[Index];
+
+	const float3 TranslatedWP = P + PreViewTranslation;
+	const float Dist = GetDistanceToNearestSurfaceGlobal(TranslatedWP);
+
+	if (Dist < Thickness)
+	{
+		const float3 Grad = GetDistanceFieldGradientGlobal(TranslatedWP);
+		const float GradLen = length(Grad);
+		if (GradLen > 1e-4f)
+		{
+			const float3 N = Grad / GradLen; // points away from the surface
+
+			// Push out to the contact shell.
+			P += N * (Thickness - Dist);
+
+			// Friction: damp the tangential part of this step's motion.
+			const float3 Step = P - Prev;
+			const float3 StepN = dot(Step, N) * N;
+			const float3 StepT = Step - StepN;
+			P -= Friction * StepT;
+
+			PredictedPositions[Index] = P;
+		}
+	}
+}

@@ -86,14 +86,16 @@ class SOFTBODYSIM_API USoftBodyComponent : public UMeshComponent
 public:
 	USoftBodyComponent();
 
-	/** Lattice particle counts along each axis (X, Y, Z). */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "32"))
+	/** Lattice/cage particle counts along each axis (X, Y, Z) — sets the cage deformation
+	 *  resolution (NOT the rendered mesh's poly count). High values get expensive fast
+	 *  (particles ~ X·Y·Z, plus a one-time init cost for weight transfer / embedding). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "64"))
 	int32 ResX = 5;
 
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "32"))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "64"))
 	int32 ResY = 5;
 
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "32"))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Lattice", meta = (ClampMin = "2", ClampMax = "64"))
 	int32 ResZ = 5;
 
 	/** Distance between adjacent lattice particles (cm). Used for the default box; when a
@@ -177,6 +179,19 @@ public:
 	/** Contact friction [0..1]: how strongly the body grips the ground / colliders. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float Friction = 0.3f;
+
+	/**
+	 * Collide against ANY mesh in the scene using Unreal's Global Distance Field (SB-M8),
+	 * in addition to the explicit collider slots + ground. Requires "Generate Mesh Distance
+	 * Fields" in Project Settings and meshes that have distance fields. Lets arbitrary
+	 * static meshes act as colliders without authoring sphere/capsule slots.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")
+	bool bUseDistanceFieldCollision = false;
+
+	/** Contact shell thickness for distance-field collision (cm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.0", EditCondition = "bUseDistanceFieldCollision"))
+	float DistanceFieldThickness = 2.0f;
 
 	/** Sphere/capsule colliders the body collides against (transforms relative to this component). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")

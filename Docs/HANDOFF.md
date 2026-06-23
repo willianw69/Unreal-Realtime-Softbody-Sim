@@ -2,7 +2,7 @@
 
 > For a new session/engineer to continue immediately. Assume zero prior context.
 > Update after every milestone — always represents the current state.
-> Last updated: 2026-06-23 (after SB-M5/M6/M7, verified in-editor; custom mesh + weight paint + XPBD).
+> Last updated: 2026-06-23 (after SB-M8, verified; distance-field collision + dynamic-bounds fix + cage cap 64).
 
 ## Project Summary
 From-scratch **GPU soft body simulation in UE 5.7** (no Chaos). Custom compute shaders do
@@ -13,45 +13,46 @@ Host project `SoftBodyDemo`, all real work in `Plugins/SoftBodySim`. Engine: `E:
 (plugin `ClothSim`, M1–M9 complete)** — copy + adapt its files (see the reuse map in `ARCHITECTURE.md`).
 
 ## Current State
-- **M0 + SB-M1–M7 COMPLETE & verified in-editor.** The `SoftBodySim` plugin runs a full volume-preserving
+- **M0 + SB-M1–M8 COMPLETE & verified in-editor.** The `SoftBodySim` plugin runs a full volume-preserving
   GPU soft body: it falls, squashes, bulges back to volume (jelly), rests on the ground, collides with
-  authored sphere/capsule shapes and itself, and is mouse-draggable. **It can now simulate any assigned
-  Static Mesh** via a free-form-deformation cage (SB-M5), with **vertex-color weight-painted per-region
-  stiffness** (SB-M6) made robust by an **XPBD distance solve** (SB-M7). Builds clean via the CLI command
-  below. Pushed to `main`.
+  authored sphere/capsule shapes, with **arbitrary scene meshes via the Global Distance Field** (SB-M8), and
+  with itself; is mouse-draggable; can simulate **any assigned Static Mesh** via an FFD cage (SB-M5) with
+  **vertex-color weight-painted stiffness** (SB-M6) made robust by an **XPBD distance solve** (SB-M7).
+  Builds clean via the CLI command below. Pushed to `main`.
 - **What exists** (all in `Plugins/SoftBodySim`): plugin/module (`/SoftBodySim`→`Shaders/`),
   `SoftBodyResources.h` (params + `FGPUConstraint` {+Softness} + `FGPUVolumeConstraint` + `FGPUCollider` +
-  `FSoftBodyTet` + resources), **9 shaders** (`SBPredict`/`SBSolveDistance`/**`SBSolveDistanceXPBD`**/
-  `SBSolveVolume`/`SBGrab`/`SBBuildGrid`/`SBSelfCollision`/`SBCollision`/`SBFinalize`), `SoftBodyCompute.cpp`
-  (RDG pipeline, `Solved`-ref ping-pong, XPBD λ buffer), `USoftBodyComponent` (cage lattice OR mesh-fit cage,
-  6-tet Kuhn split → `Tets`, distance + volume constraints + coloring, **mesh embedding** `BuildEmbedding`,
-  **weight sampling** `BuildParticleWeights`, boundary surface, grab, colliders, self-collision, fixed-step
+  `FSoftBodyTet` + resources), **10 shaders** (`SBPredict`/`SBSolveDistance`/`SBSolveDistanceXPBD`/
+  `SBSolveVolume`/`SBGrab`/`SBBuildGrid`/`SBSelfCollision`/`SBCollision`/**`SBCollisionDF`**/`SBFinalize`),
+  `SoftBodyCompute.cpp` (RDG pipeline, `Solved`-ref ping-pong, XPBD λ buffer), `FSoftBodySceneViewExtension`
+  (`SoftBodySceneViewExtension.h/.cpp` — GDF snapshot), `USoftBodyComponent` (cage lattice OR mesh-fit cage,
+  6-tet Kuhn split → `Tets`, distance + volume constraints + coloring, mesh embedding, weight sampling,
+  boundary surface, grab, colliders, self-collision, **DF collision**, **per-frame dynamic bounds**, fixed-step
   dispatch, readback→verts), `FSoftBodyMeshSceneProxy`, `ASoftBodyActor`. Demo: `Content/M_Softbody`.
 - **Per-substep pipeline:** `SBPredict → [distance (XPBD|PBD); volume]×iters → [self-collision ×iters, ping-pong]
-  → [SBGrab] → SBCollision (shapes+ground) → SBFinalize → readback`.
-- **Key knobs:** SB-M1–M4 ones (VolumeStiffness, Substeps, SolverIterations, Anchor, ground, Colliders,
-  self-collision, mouse drag) **plus**: `SourceMesh`/`CagePadding` (SB-M5); `bWeightPaintStiffness`/
-  `bVisualizeWeights`/`bInvertWeightPaint`/`XpbdSoftCompliance` (SB-M6/M7); `bUseXPBD`/`XpbdGlobalCompliance` (SB-M7).
-- **DEMO ASSET NOTE:** the in-editor test used a ~57 MB AI-generated bunny (`Content/tripo_convert_*` +
-  `cute_bunny_3d_model_*` textures) that is **deliberately NOT committed** (too large for the repo, no LFS,
-  third-party provenance) — see `.gitignore`. The committed `LV_Demo` uses the box soft body. To reproduce
-  mesh embedding, assign any Static Mesh to `SoftBody → SourceMesh` (engine `/Engine/BasicShapes/Sphere`
-  works); for weight paint, give it vertex colors (Static Mesh editor Paint mode or DCC).
+  → [SBGrab] → SBCollision (shapes+ground) → [SBCollisionDF] → SBFinalize → readback`.
+- **Key knobs:** earlier ones **plus** `bUseDistanceFieldCollision`/`DistanceFieldThickness` (SB-M8). Cage
+  `ResX/Y/Z` cap is now 64. `r.GenerateMeshDistanceFields=True` is set in `DefaultEngine.ini` (DF collision needs it).
+- **DEMO ASSET NOTE:** in-editor tests used large AI-generated meshes (~50–57 MB: `tripo_convert_*`,
+  `MilkDragons`, `*_3d_model_*` + textures) that are **deliberately NOT committed** (repo size, no LFS,
+  third-party provenance) — see `.gitignore`. The committed `LV_Demo` uses the box soft body; `LV_Demo.umap`
+  stays modified locally with the test setup but isn't committed. To reproduce: assign any Static Mesh to
+  `SoftBody → SourceMesh` (engine `/Engine/BasicShapes/Sphere` works), give it vertex colors for weight paint,
+  and drop DF-enabled static meshes nearby for DF collision.
 
 ## Immediate Next Task — none mandatory; SB-M+ stretch list
-Every planned milestone + the user's mesh/weight-paint requests are delivered and verified. No milestone is
-in progress. Optional next steps, in rough value order — confirm with the user which (if any) to pursue, then
-follow `WORKFLOW.md` (build with editor closed → verify → docs/commit):
+Every planned milestone + the user's mesh / weight-paint / arbitrary-mesh-collider requests are delivered and
+verified. No milestone is in progress. Optional next steps, in rough value order — confirm with the user which
+(if any) to pursue, then follow `WORKFLOW.md` (build with editor closed → verify → docs/commit):
 1. **Profiling pass** — `stat GPU` / Unreal Insights at a few cage resolutions; record per-pass cost in DEVLOG.
    Cheap, high-signal for the portfolio. Good first pick.
-2. **XPBD volume solve** — extend XPBD (already done for distance, SB-M7) to the volume constraint so volume
-   stiffness is also iteration-independent and weight-paintable (note: volume compliance has different units —
-   scale per tet rest-volume).
+2. **Higher-fidelity colliders** — the SB-M8 GDF is coarse for thin/small meshes. For a specific collider, bake
+   a custom SDF volume (or sample a per-mesh DF) for sharp contact. Overlaps with #3.
 3. **Non-box / conforming cage** — SDF-voxelize the assigned mesh to keep only cage cells inside it, so the
    cage hugs the shape (tighter sim than the current bounding-box FFD cage).
-4. **Render-mesh skinning upgrade** — smooth/multi-tet barycentric bind (current SB-M5 binds each vert to one
-   tet) for cleaner deformation on coarse cages; optional zero-copy GPU vertex write (drop the render readback,
-   keep a small one for mouse picking); multiple bodies.
+4. **XPBD volume solve** — extend XPBD (done for distance, SB-M7) to the volume constraint (note: volume
+   compliance has different units — scale per tet rest-volume).
+5. **Render-mesh skinning upgrade** — smooth/multi-tet barycentric bind (current SB-M5 binds each vert to one
+   tet) for cleaner deformation on coarse cages; zero-copy GPU vertex write; multiple bodies.
 - The cloth project (`RT_ClothSim`) has reference implementations/habits for profiling.
 
 ## Notes for whoever continues
@@ -102,10 +103,10 @@ gotchas in `WORKFLOW.md`.
 > "Read `Docs/HANDOFF.md`, `Docs/PROJECT_STATE.md`, `Docs/ARCHITECTURE.md`, and `Docs/WORKFLOW.md` to
 > load context. This is a from-scratch GPU **soft body** sim in UE 5.7 (host `SoftBodyDemo`, plugin
 > `SoftBodySim`), reusing the framework from the sibling cloth project at `E:\ClaudeCode\RT_ClothSim`
-> (plugin `ClothSim`). M0 + SB-M1–M7 are done and verified — GPU tetrahedral sim, volume-preserving jelly,
-> mouse drag, sphere/capsule + self-collision, custom-mesh FFD embedding, vertex-color weight-painted
-> stiffness, and an XPBD distance solve. Pick an item from 'Immediate Next Task — SB-M+ stretch list' in
-> HANDOFF (or ask me which to do), following `WORKFLOW.md`:
+> (plugin `ClothSim`). M0 + SB-M1–M8 are done and verified — GPU tetrahedral sim, volume-preserving jelly,
+> mouse drag, sphere/capsule + self + Global-Distance-Field collision, custom-mesh FFD embedding,
+> vertex-color weight-painted stiffness, and an XPBD distance solve. Pick an item from 'Immediate Next Task
+> — SB-M+ stretch list' in HANDOFF (or ask me which to do), following `WORKFLOW.md`:
 > build via the CLI command in HANDOFF with the editor closed, then WAIT for me to verify in-editor before
 > updating docs or committing.
 > Update PROJECT_STATE/ROADMAP/DEVLOG/HANDOFF/PORTFOLIO_NOTES (+ARCHITECTURE if it changes) per

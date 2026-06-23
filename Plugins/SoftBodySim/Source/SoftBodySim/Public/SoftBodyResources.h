@@ -113,6 +113,11 @@ struct FSoftBodyParams
 	TArray<FGPUCollider> Colliders;
 	float   Friction = 0.3f;
 
+	// Distance-field collision (SB-M8) — collide against ANY scene mesh via the Global
+	// Distance Field, in addition to the analytic colliders + ground.
+	bool    bUseDistanceFieldCollision = false;
+	float   DFThickness = 2.0f; // contact shell thickness (cm)
+
 	// Built-in ground plane — infinite floor at world Z = GroundZ (normal +Z).
 	bool    bGroundPlane = true;
 	float   GroundZ = 0.0f;

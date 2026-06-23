@@ -173,4 +173,26 @@ accumulator race-free for free.
 arbitrary meshes, vertex-color-painted per-region stiffness, and an XPBD compliance solver for
 iteration-count-independent material stiffness."
 
+## SB-M8 — Distance-field collision vs arbitrary meshes ✅ 2026-06-23
+**Shipped:** The soft body collides against any mesh in the scene (ramps, statues, the environment) with no
+authored collider shapes, by sampling Unreal's Global Distance Field.
+
+**Talking points:**
+- **GDF collision from a standalone compute pass:** a `FSceneViewExtension` snapshots the renderer's Global
+  Distance Field parameters after the base pass into a render-thread cache, which a custom RDG compute pass
+  then samples (`GetDistanceToNearestSurfaceGlobal` + gradient) to project particles out of the nearest
+  surface. Demonstrates integrating a custom simulation with the deferred renderer's own data (the same
+  field Niagara GPU collision uses), and understanding *why* the GDF — not per-mesh distance fields — is the
+  representation Unreal exposes to a standalone shader.
+- **Bug hunt — disappearing mesh:** diagnosed a "mesh vanishes when it moves far" report as stale scene-proxy
+  bounds (computed once at spawn) frustum-culling the body once it left its original box; fixed by
+  recomputing bounds from the deformed verts each frame and pushing them via `UpdateBounds` +
+  `MarkRenderTransformDirty`. A clean example of reasoning from a visual symptom to a render-thread cause.
+- **Layered collision:** ground plane + analytic sphere/capsule + spatial-hash self-collision + scene GDF
+  all compose in one substep, each as its own race-free pass.
+
+**Resume bullet candidate:** "Added distance-field collision letting a GPU soft body collide with arbitrary
+scene geometry by sampling Unreal's Global Distance Field from a custom compute pass via a scene view
+extension."
+
 <!-- Append SB-M+ / further sections below as work is completed. -->

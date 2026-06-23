@@ -1,7 +1,7 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-23 (SB-M5/M6/M7 complete + verified in-editor — custom mesh, weight paint, XPBD).
+> Last updated: 2026-06-23 (SB-M8 distance-field collision + dynamic-bounds fix + cage cap → 64).
 
 | Milestone | Title | Status |
 |---|---|---|
@@ -13,7 +13,8 @@
 | SB-M5 | Custom mesh embedding (FFD cage) | ✅ |
 | SB-M6 | Weight-painted per-region stiffness | ✅ |
 | SB-M7 | XPBD compliance (distance solve) | ✅ |
-| SB-M+ | Sphere/SDF cage shapes, render-mesh skinning upgrade, multiple bodies, zero-copy verts, profiling | ⏳ (stretch) |
+| SB-M8 | Distance-field collision (Global Distance Field) | ✅ |
+| SB-M+ | Per-mesh/custom SDF colliders, conforming cage, XPBD volume, render-mesh skinning, multiple bodies, profiling | ⏳ (stretch) |
 
 ## Notes per Milestone
 
@@ -86,8 +87,20 @@ longer washes out). Per-constraint compliance = `XpbdGlobalCompliance + Softness
 `bUseXPBD` toggles vs the old PBD path (compliance 0 ≡ rigid, so the default matches SB-M1..M6); volume
 stays PBD. The main softness dial is now `XpbdSoftCompliance`.
 
+### SB-M8 — Distance-field collision ✅ (verified in-editor 2026-06-23)
+Collide the body against ANY scene mesh via Unreal's **Global Distance Field** — ported from the cloth
+sim. `FSoftBodySceneViewExtension` (`SoftBodyGDF::EnsureRegistered`/`Get`) snapshots the GDF parameters +
+view each frame in `PostRenderBasePassDeferred_RenderThread`; `SBCollisionDF.usf` samples
+`GetDistanceToNearestSurfaceGlobal` + gradient per particle and projects out of the contact shell (+
+friction). `FSBCollisionDFCS` binds `FGlobalDistanceFieldParameters2` + the View UB; the pass runs after
+analytic collision, on `Solved`. Knobs `bUseDistanceFieldCollision`/`DistanceFieldThickness`; on-screen GDF
+diagnostic. Requires "Generate Mesh Distance Fields" (now set in `DefaultEngine.ini`). Additive with the
+ground + sphere/capsule colliders. **Also in this milestone:** fixed a culling bug (bounds now recompute
+every frame from the deformed body + push to the render thread, so it no longer vanishes when it moves far
+from the actor); raised the cage `ResX/Y/Z` cap 32 → 64.
+
 ### SB-M+ — Stretch ⏳
-Sphere/arbitrary cage shapes via SDF voxelization + boundary-from-tets extraction; a higher-quality
-render-mesh skinning upgrade (smooth-bind / multi-tet weights); XPBD for the volume solve too; multiple
-bodies; zero-copy GPU vertex write (compute writes the vertex buffer directly); `stat GPU`/Insights
-profiling pass.
+Higher-fidelity colliders than the GDF for a specific mesh (custom baked SDF / per-mesh distance field);
+conforming (non-box) cage via SDF voxelization + boundary-from-tets; a higher-quality render-mesh skinning
+upgrade (smooth-bind / multi-tet weights); XPBD for the volume solve too; multiple bodies; zero-copy GPU
+vertex write; `stat GPU`/Insights profiling pass.

@@ -8,6 +8,9 @@
 #include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
 #include "DataDrivenShaderPlatformInfo.h"
+#include "GlobalDistanceFieldParameters.h" // FGlobalDistanceFieldParameters2 + SetupGlobalDistanceFieldParameters_Minimal (SB-M8)
+#include "SoftBodySceneViewExtension.h"    // GDF snapshot cache
+#include "SceneView.h"                     // FViewUniformShaderParameters
 
 // Must match [numthreads(...)] in every soft body .usf. Injected as a #define.
 static constexpr uint32 kThreadGroupSize = 64;
@@ -272,6 +275,38 @@ public:
 	}
 };
 
+// Distance-field collision against arbitrary scene meshes via the Global Distance Field (SB-M8).
+class FSBCollisionDFCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBCollisionDFCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBCollisionDFCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, PredictedPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float3>, PrevPositions)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(FVector3f, PreViewTranslation)
+		SHADER_PARAMETER(float, Thickness)
+		SHADER_PARAMETER(float, Friction)
+		// The GDF inputs come from this struct; View is only needed to satisfy the engine
+		// header's transitive ResolvedView references.
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FGlobalDistanceFieldParameters2, GlobalDistanceFieldParameters)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+	}
+};
+
 class FSBFinalizeCS : public FGlobalShader
 {
 public:
@@ -306,6 +341,7 @@ IMPLEMENT_GLOBAL_SHADER(FSBGrabCS,          "/SoftBodySim/Private/SBGrab.usf",  
 IMPLEMENT_GLOBAL_SHADER(FSBBuildGridCS,     "/SoftBodySim/Private/SBBuildGrid.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSelfCollisionCS, "/SoftBodySim/Private/SBSelfCollision.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionCS,     "/SoftBodySim/Private/SBCollision.usf",     "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBCollisionDFCS,   "/SoftBodySim/Private/SBCollisionDF.usf",   "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBFinalizeCS,      "/SoftBodySim/Private/SBFinalize.usf",      "MainCS", SF_Compute);
 
 //////////////////////////////////////////////////////////////////////////
@@ -503,7 +539,12 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	TShaderMapRef<FSBSelfCollisionCS> SelfCollisionCS(ShaderMap);
 	TShaderMapRef<FSBGrabCS>          GrabCS(ShaderMap);
 	TShaderMapRef<FSBCollisionCS>     CollisionCS(ShaderMap);
+	TShaderMapRef<FSBCollisionDFCS>   CollisionDFCS(ShaderMap);
 	TShaderMapRef<FSBFinalizeCS>      FinalizeCS(ShaderMap);
+
+	// Distance-field collision uses the GDF snapshot captured by the view extension (SB-M8).
+	const FSoftBodyGDFCache& GDFCache = SoftBodyGDF::Get();
+	const bool bDoDistanceField = Params.bUseDistanceFieldCollision && GDFCache.bValid;
 
 	const bool bDoGrab = Params.bGrabActive
 		&& Params.GrabIndex >= 0
@@ -721,6 +762,25 @@ void SoftBodyCompute::Dispatch_RenderThread(
 				FComputeShaderUtils::AddPass(GraphBuilder,
 					RDG_EVENT_NAME("SBCollision (substep %d)", Step),
 					CollisionCS, P, GroupCount);
+			}
+
+			// --- Distance-field collision: project out of ANY scene mesh via the GDF (SB-M8) ---
+			if (bDoDistanceField)
+			{
+				FSBCollisionDFCS::FParameters* P = GraphBuilder.AllocParameters<FSBCollisionDFCS::FParameters>();
+				P->PredictedPositions = GraphBuilder.CreateUAV(Solved);
+				P->PrevPositions      = GraphBuilder.CreateSRV(Positions);
+				P->InvMasses          = InvMassesSRV;
+				P->NumParticles       = (uint32)Num;
+				P->PreViewTranslation = GDFCache.PreViewTranslation;
+				P->Thickness          = Params.DFThickness;
+				P->Friction           = Params.Friction;
+				P->View               = GDFCache.ViewUniformBuffer;
+				P->GlobalDistanceFieldParameters = SetupGlobalDistanceFieldParameters_Minimal(GDFCache.Data);
+
+				FComputeShaderUtils::AddPass(GraphBuilder,
+					RDG_EVENT_NAME("SBCollisionDF (substep %d)", Step),
+					CollisionDFCS, P, GroupCount);
 			}
 
 			// --- Finalize: derive velocity, commit positions ---

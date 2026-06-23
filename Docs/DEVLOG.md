@@ -258,4 +258,45 @@ shapes, XPBD volume, render-mesh skinning upgrade, multiple bodies, zero-copy ve
 
 ---
 
+## 2026-06-23 — SB-M8: distance-field collision (+ dynamic-bounds fix, cage cap 64)
+**What:** The body can now collide against ANY scene mesh via Unreal's **Global Distance Field**, ported
+from the cloth sim's M6. `FSoftBodySceneViewExtension` (`Public/SoftBodySceneViewExtension.h` +
+`Private/.cpp`) registers a scene view extension that, in `PostRenderBasePassDeferred_RenderThread`,
+snapshots the GDF parameter data + pre-view translation + View uniform buffer into a render-thread cache
+(`SoftBodyGDF::Get`). `SBCollisionDF.usf` + `FSBCollisionDFCS` sample `GetDistanceToNearestSurfaceGlobal`
+(+ `GetDistanceFieldGradientGlobal`) per particle in translated world space and push out of the contact
+shell with tangential friction; it binds `FGlobalDistanceFieldParameters2` (via
+`SetupGlobalDistanceFieldParameters_Minimal`) + the View UB. The pass runs after the analytic collision
+pass, in place on `Solved`, gated by `bUseDistanceFieldCollision && GDFCache.bValid`. Component props
+`bUseDistanceFieldCollision`/`DistanceFieldThickness`; `SoftBodyGDF::EnsureRegistered()` in BeginPlay; an
+on-screen GDF diagnostic (valid/clipmaps). `r.GenerateMeshDistanceFields=True` added to `DefaultEngine.ini`.
+
+Bundled fixes in the same milestone:
+- **Culling bug (mesh vanishing when far from the actor):** the scene proxy's bounds were computed once at
+  BeginPlay and never updated, so a body that fell / was dragged / pushed out of its original box got
+  frustum-culled. Fixed: `UpdateMeshFromSimulation` now accumulates the deformed verts' local-space FBox each
+  frame, sets `LocalBounds` (+ a margin), and calls `UpdateBounds()` + `MarkRenderTransformDirty()` to push
+  the new bounds to the render thread. Applies to both box and embedded-mesh modes.
+- **Cage cap raised 32 → 64** per axis (`ResX/Y/Z`), with a tooltip noting the cost (particle count + a
+  one-time init cost for weight transfer / embedding at high res).
+
+**Why:** "Use arbitrary meshes as colliders" without authoring sphere/capsule slots. The GDF is the only
+distance-field representation Unreal cleanly exposes to a standalone compute shader (per-mesh DFs are
+renderer-internal to bind), and it's the same path Niagara uses — so it was a faithful, low-risk port.
+The bounds bug was pre-existing (static bounds since SB-M1) but only became obvious once bodies travelled
+far (free fall from height, mouse fling, DF push-out).
+
+**Problems & solutions:** None at build — the `Renderer` module dep was already added in SB-M1 anticipating
+this, so `FXRenderingUtils` / GDF headers resolved. Build was briefly blocked by the open editor's Live
+Coding (the change set was `.cpp`-only, so Ctrl+Alt+F11 would also have worked).
+
+**Performance:** One extra compute pass per substep when DF collision is on (one GDF sample + gradient per
+particle). Dynamic bounds add an O(particles) FBox accumulation + a transform-dirty per frame (negligible).
+
+**Next:** Sim is feature-complete for the project's goals. SB-M+ stretch: higher-fidelity per-mesh/custom
+SDF colliders (vs the coarse scene GDF), conforming cage, XPBD volume, render-mesh skinning upgrade,
+multiple bodies, profiling.
+
+---
+
 <!-- Append SB-M+ / further entries below after each is implemented + verified in-editor. -->

@@ -43,3 +43,10 @@ Thumbs.db
 /Content/tripo_convert_*.uasset
 /Content/tripo_mat_*.uasset
 /Content/cute_bunny_3d_model_*.uasset
+
+# More large / third-party test imports (SB-M8 DF-collision testing) — kept out of the repo.
+/Content/MilkDragons.uasset
+/Content/plate1.uasset
+/Content/M_Plate.uasset
+/Content/*_3d_model_*.uasset
+/Content/_GENERATED/
