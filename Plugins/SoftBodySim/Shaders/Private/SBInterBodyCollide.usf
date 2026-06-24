@@ -1,0 +1,108 @@
+// SBInterBodyCollide.usf
+//
+// Multi-body collision RESPONSE pass (SB-M9). One thread per particle, over the COMBINED
+// particle set of all participating soft bodies (concatenated into one buffer by the
+// world subsystem). Using a shared spatial hash grid built over every body's particles,
+// each particle repels close particles that belong to a DIFFERENT body — so separate
+// soft body actors push each other apart and pile/squash realistically.
+//
+// This is the cross-body analogue of SBSelfCollision.usf: same Jacobi gather (read the
+// input snapshot, write only this particle's own slot — no atomics, no races), but the
+// exclusion is "same body" (BodyIds[j] == BodyIds[i]) instead of the lattice 1-ring.
+// Intra-body collision is still handled per-body by SBSelfCollision; this pass only
+// resolves contacts BETWEEN bodies.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+#ifndef MAX_PER_CELL
+#define MAX_PER_CELL 16
+#endif
+
+StructuredBuffer<float3>	PredictedIn;	// combined positions (world space, snapshot)
+StructuredBuffer<float>		InvMasses;		// combined inverse masses
+StructuredBuffer<uint>		BodyIds;		// combined per-particle body index
+Buffer<uint>				CellCounts;		// [TableSize] (typed, matches build pass)
+StructuredBuffer<uint>		CellParticles;	// [TableSize * MAX_PER_CELL]
+RWStructuredBuffer<float3>	PredictedOut;	// this particle's corrected position
+
+uint	NumParticles;	// total across all bodies
+uint	TableSize;
+float	CellSize;		// = Thickness
+float	Thickness;		// min separation between particles of different bodies
+float	SelfStiffness;	// [0,1] repulsion strength
+
+uint HashCell(int3 C)
+{
+	const uint H = (uint)(C.x * 73856093) ^ (uint)(C.y * 19349663) ^ (uint)(C.z * 83492791);
+	return H % TableSize;
+}
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	const float Wi = InvMasses[Index];
+	const float3 Pi = PredictedIn[Index];
+	const uint BodyI = BodyIds[Index];
+
+	if (Wi <= 0.0f)
+	{
+		PredictedOut[Index] = Pi; // pinned: pass through unchanged
+		return;
+	}
+
+	const int3 BaseCell = (int3)floor(Pi / CellSize);
+
+	float3 Correction = float3(0.0f, 0.0f, 0.0f);
+
+	[loop]
+	for (int dz = -1; dz <= 1; ++dz)
+	[loop]
+	for (int dy = -1; dy <= 1; ++dy)
+	[loop]
+	for (int dx = -1; dx <= 1; ++dx)
+	{
+		const uint Bucket = HashCell(BaseCell + int3(dx, dy, dz));
+		const uint Count = min(CellCounts[Bucket], (uint)MAX_PER_CELL);
+
+		for (uint s = 0; s < Count; ++s)
+		{
+			const uint J = CellParticles[Bucket * (uint)MAX_PER_CELL + s];
+			if (J == Index)
+			{
+				continue;
+			}
+
+			// Only collide against OTHER bodies; intra-body is handled by self-collision.
+			if (BodyIds[J] == BodyI)
+			{
+				continue;
+			}
+
+			const float Wj = InvMasses[J];
+			const float WSum = Wi + Wj;
+			if (WSum <= 1e-8f)
+			{
+				continue;
+			}
+
+			const float3 D = Pi - PredictedIn[J];
+			const float Len = length(D);
+			if (Len < Thickness && Len > 1e-5f)
+			{
+				const float3 N = D / Len;
+				Correction += (Wi / WSum) * (Thickness - Len) * N;
+			}
+		}
+	}
+
+	PredictedOut[Index] = Pi + SelfStiffness * Correction;
+}

@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-23 (SB-M1–M8 — adds Global-Distance-Field collision + dynamic render bounds).
+> Last updated: 2026-06-24 (SB-M1–M9 — adds multi-body collision via a world subsystem + shared spatial hash).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
 **Status note (through SB-M7):** the SB-M1–M4 core (lattice, 6-tet Kuhn split, distance + per-tet volume
@@ -21,6 +21,11 @@ render) is all implemented, plus three additions:
 - **Dynamic render bounds (SB-M8 fix):** the component recomputes `LocalBounds` from the deformed verts each
   frame and pushes them to the render thread (`UpdateBounds` + `MarkRenderTransformDirty`) so the body isn't
   frustum-culled when it travels far from the actor.
+- **Multi-body collision (SB-M9):** `USoftBodyWorldSubsystem` registers all components and, after they sim,
+  enqueues `SoftBodyCompute::DispatchInterBody_RenderThread` — concatenate every opted-in body's Positions/
+  InvMasses + body-id into combined buffers, build a shared hash grid (`SBBuildGrid.usf`), repel different-body
+  particles (`SBInterBodyCollide.usf`), copy corrections back to each body's Positions. A post-sim positional
+  projection; per-body substeps untouched.
 
 Actual per-substep pipeline:
 `SBPredict → [colored-GS distance (XPBD or PBD) + colored-GS volume]×iters → [self-collision build+respond

@@ -202,4 +202,15 @@ namespace SoftBodyCompute
 		FRHICommandListImmediate& RHICmdList,
 		const TSharedPtr<FSoftBodyRenderResources>& Resources,
 		const FSoftBodyParams& Params);
+
+	/** Multi-body collision (SB-M9): a single post-sim positional correction over ALL
+	 *  participating bodies. Concatenates their committed Positions into a shared grid and
+	 *  repels particles of different bodies apart, writing the corrections back into each
+	 *  body's Positions buffer. Runs after every body's Dispatch this frame. */
+	void DispatchInterBody_RenderThread(
+		FRHICommandListImmediate& RHICmdList,
+		const TArray<TSharedPtr<FSoftBodyRenderResources>>& Bodies,
+		float Thickness,
+		float Stiffness,
+		int32 Iterations);
 }

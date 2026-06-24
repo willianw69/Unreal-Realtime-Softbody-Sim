@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 > Single source of truth for current project status. Update after every milestone.
-> Last updated: 2026-06-23 (SB-M8 distance-field collision + dynamic-bounds culling fix + cage cap 64).
+> Last updated: 2026-06-24 (SB-M9 multi-body collision via a world subsystem + shared spatial hash).
 
 ## Project Overview
 Real-time **GPU soft body simulation built from scratch** in **Unreal Engine 5.7**, as a
@@ -24,11 +24,12 @@ constraints** · **mouse dragging** · **volume preservation (jelly)** · UE 5.7
 similar to Obi/Zibra soft body.
 
 ## Current Milestone
-**SB-M8 — Distance-field collision: COMPLETE + verified in-editor (2026-06-23).** The body now collides
-against ANY scene mesh via Unreal's Global Distance Field (no need to author sphere/capsule slots), ported
-from the cloth sim. This milestone also fixed a culling bug — bounds now follow the deformed body each
-frame, so it no longer disappears when it moves far from the actor — and raised the cage `Res` cap to 64.
-With M1–M8 the sim is feature-complete for the project's goals; remaining items are SB-M+ stretch polish.
+**SB-M9 — Multi-body collision: COMPLETE + verified in-editor (2026-06-24).** Multiple soft body actors now
+collide with each other: a `USoftBodyWorldSubsystem` gathers all opted-in bodies and runs one shared
+spatial-hash repulsion pass per frame so particles of different bodies push apart (bodies pile/squash
+together). With M1–M9 the sim covers everything requested — GPU jelly, volume, drag, ground/shape/self/
+arbitrary-mesh/multi-body collision, custom-mesh embedding, weight-painted stiffness, XPBD. Remaining is
+SB-M+ stretch polish.
 
 ## Completed Milestones
 - **M0 — Bootstrap.** UE 5.7 C++ host project `SoftBodyDemo` (BuildSettings V6, DX12,
@@ -73,12 +74,18 @@ With M1–M8 the sim is feature-complete for the project's goals; remaining item
   on-screen GDF diagnostic; needs `r.GenerateMeshDistanceFields=True` (set in `DefaultEngine.ini`). Also
   fixed dynamic bounds (per-frame `UpdateBounds`+`MarkRenderTransformDirty` from the deformed verts) and
   raised the cage cap to 64.
+- **SB-M9 — Multi-body collision.** `USoftBodyWorldSubsystem` (UWorldSubsystem + FTickableGameObject)
+  registers components and enqueues `SoftBodyCompute::DispatchInterBody_RenderThread` once per frame:
+  concatenate all opted-in bodies' Positions/InvMasses + body-id into combined buffers, build a shared hash
+  grid (`SBBuildGrid.usf`), repel different-body particles (`SBInterBodyCollide.usf` + `FSBInterBodyCollideCS`),
+  copy corrections back. Per-body opt-in props `bInterBodyCollision`/`InterBodyThickness`/`InterBodyStiffness`/
+  `InterBodyIterations`; component exposes `GetRenderResources()` for the subsystem.
 
 ## Next Milestone
-**SB-M+ (stretch).** The sim is feature-complete for the project's goals. Optional depth: higher-fidelity
-colliders for a specific mesh (custom baked SDF / per-mesh DF, vs the coarser scene GDF); conforming non-box
-cage; higher-quality render-mesh skinning; XPBD for the volume solve; multiple bodies; zero-copy GPU vertex
-write; a `stat GPU`/Unreal Insights profiling pass. See `ROADMAP.md`. No milestone is currently in progress.
+**SB-M+ (stretch).** The sim covers all requested features. Optional depth: higher-fidelity colliders for a
+specific mesh (custom baked SDF / per-mesh DF, vs the coarser scene GDF); conforming non-box cage; higher-
+quality render-mesh skinning; XPBD for the volume solve; broadphase for many inter-body bodies; zero-copy GPU
+vertex write; a `stat GPU`/Unreal Insights profiling pass. See `ROADMAP.md`. No milestone is currently in progress.
 
 ## Technical Decisions
 - **Method:** tetrahedral XPBD — a particle lattice filled with tetrahedra; solve **distance**
@@ -110,6 +117,9 @@ write; a `stat GPU`/Unreal Insights profiling pass. See `ROADMAP.md`. No milesto
 - Distance-field collision samples the scene-wide **Global Distance Field** (coarse clipmaps, camera-centered,
   1-frame lag) — great for large/static geometry, soft on thin/small/distant objects. A higher-fidelity
   per-mesh/custom-baked SDF is a stretch item. Needs `r.GenerateMeshDistanceFields=True`.
+- Multi-body collision is a per-frame post-sim positional projection (~1-frame lag), particle-level (contact
+  resolution tracks cage density + InterBodyThickness), with no broadphase across bodies yet — fine for a
+  handful of bodies; many bodies would want a spatial-partition broadphase.
 - Mouse drag picks/moves in the camera view plane at the grab depth (no toward/away-camera pull); CPU
   brute-force nearest-particle pick over the boundary list (fine at demo resolutions).
 - Custom-mesh deformation is **cage-based FFD**: a coarse cage looks blobby (raise ResX/Y/Z to follow the

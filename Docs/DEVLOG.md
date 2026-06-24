@@ -299,4 +299,42 @@ multiple bodies, profiling.
 
 ---
 
+## 2026-06-24 — SB-M9: multi-body collision (shared spatial hash)
+**What:** Separate `SoftBody` actors now collide with each other. New `USoftBodyWorldSubsystem`
+(`UWorldSubsystem` + `FTickableGameObject`) registers every live component (BeginPlay/EndPlay) and, once
+per frame, gathers the bodies that opted in (`bInterBodyCollision`) and enqueues a single render command:
+`SoftBodyCompute::DispatchInterBody_RenderThread`. That pass concatenates every participating body's
+committed `Positions` + `InvMasses` into combined buffers (`AddCopyBufferPass` into per-body offsets) plus a
+CPU-built per-particle body-id buffer, builds a **shared** spatial hash over all of them (reusing the SB-M4
+`SBBuildGrid.usf` / `FSBBuildGridCS`), and runs `SBInterBodyCollide.usf` (`FSBInterBodyCollideCS`) — the
+cross-body twin of self-collision: each particle repels close neighbours whose body-id differs (same-body
+pairs skipped, since intra-body is handled by self-collision), Jacobi-gathered into a ping-pong buffer over
+`InterBodyIterations`. The corrected positions are copied back into each body's persistent `Positions`
+buffer. The component exposes `GetRenderResources()` so the subsystem can register their pooled buffers;
+opt-in props `bInterBodyCollision`/`InterBodyThickness`/`InterBodyStiffness`/`InterBodyIterations` (the
+subsystem uses the max across participants).
+
+**Why:** "Make multiple soft body actors collide." Each body sims independently with its own buffers, so
+the natural design is a coordinator that runs ONE cross-body pass over all of them. Doing it as a *post-sim
+positional projection* (after every body's Dispatch commits its Positions) means each body's substep loop is
+untouched — minimal coupling, and it reuses the entire self-collision hash-grid machinery (the only change
+is "skip same body-id" instead of "skip lattice 1-ring"). Combined buffers are transient (rebuilt each frame
+from the bodies' committed state), so there's no cross-frame pooled state to manage.
+
+**Problems & solutions:** None at build. Thread-safety: the subsystem captures the bodies'
+`TSharedPtr<FSoftBodyRenderResources>` (not raw buffer refs) into the render command and reads
+`PositionsBuffer`/`NumParticles`/`bInitialized` on the render thread, avoiding a game-thread read of
+render-thread-owned buffers. Ordering: the subsystem ticks during the world tick and enqueues after the
+components' per-body dispatches, so its correction sees this frame's committed positions (FIFO render queue);
+a ~1-frame lag is harmless for soft contact. λ-style buffers not needed (Jacobi repulsion).
+
+**Performance:** One combined build + repel pass per `InterBodyIterations` per frame over the summed particle
+count, plus a few buffer copies. No broadphase across bodies yet — fine for a handful; many bodies would want
+a spatial partition. Particle-level, so contact sharpness tracks cage density + `InterBodyThickness`.
+
+**Next:** All requested features are in. SB-M+ stretch: higher-fidelity per-mesh/custom SDF colliders,
+conforming cage, XPBD volume, render-mesh skinning upgrade, inter-body broadphase, zero-copy verts, profiling.
+
+---
+
 <!-- Append SB-M+ / further entries below after each is implemented + verified in-editor. -->

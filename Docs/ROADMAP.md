@@ -1,7 +1,7 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-23 (SB-M8 distance-field collision + dynamic-bounds fix + cage cap → 64).
+> Last updated: 2026-06-24 (SB-M9 multi-body collision).
 
 | Milestone | Title | Status |
 |---|---|---|
@@ -14,7 +14,8 @@
 | SB-M6 | Weight-painted per-region stiffness | ✅ |
 | SB-M7 | XPBD compliance (distance solve) | ✅ |
 | SB-M8 | Distance-field collision (Global Distance Field) | ✅ |
-| SB-M+ | Per-mesh/custom SDF colliders, conforming cage, XPBD volume, render-mesh skinning, multiple bodies, profiling | ⏳ (stretch) |
+| SB-M9 | Multi-body collision (shared spatial hash) | ✅ |
+| SB-M+ | Per-mesh/custom SDF colliders, conforming cage, XPBD volume, render-mesh skinning, zero-copy verts, profiling | ⏳ (stretch) |
 
 ## Notes per Milestone
 
@@ -99,8 +100,20 @@ ground + sphere/capsule colliders. **Also in this milestone:** fixed a culling b
 every frame from the deformed body + push to the render thread, so it no longer vanishes when it moves far
 from the actor); raised the cage `ResX/Y/Z` cap 32 → 64.
 
+### SB-M9 — Multi-body collision ✅ (verified in-editor 2026-06-24)
+A `USoftBodyWorldSubsystem` (UWorldSubsystem + FTickableGameObject) registers every live component and, once
+per frame after all bodies sim, enqueues one GPU pass (`SoftBodyCompute::DispatchInterBody_RenderThread`):
+concatenate every participating body's committed Positions/InvMasses into combined buffers (`AddCopyBufferPass`)
++ a per-particle body-id, build a **shared spatial hash** over all of them (reusing `SBBuildGrid.usf`), and
+run `SBInterBodyCollide.usf` to repel particles of DIFFERENT bodies apart (same-body pairs skipped — handled
+by self-collision), ping-ponging over `InterBodyIterations`; then copy the corrected positions back into each
+body's Positions buffer. A post-sim positional projection, so each body's substep is untouched. Opt-in per
+body via `bInterBodyCollision` (+ `InterBodyThickness`/`InterBodyStiffness`/`InterBodyIterations`; the
+subsystem uses the max across participants). Bodies pile/squash together. ~1-frame lag (acceptable for soft
+contact); particle-level so resolution tracks cage density.
+
 ### SB-M+ — Stretch ⏳
 Higher-fidelity colliders than the GDF for a specific mesh (custom baked SDF / per-mesh distance field);
 conforming (non-box) cage via SDF voxelization + boundary-from-tets; a higher-quality render-mesh skinning
-upgrade (smooth-bind / multi-tet weights); XPBD for the volume solve too; multiple bodies; zero-copy GPU
-vertex write; `stat GPU`/Insights profiling pass.
+upgrade (smooth-bind / multi-tet weights); XPBD for the volume solve too; broadphase for many inter-body
+bodies; zero-copy GPU vertex write; `stat GPU`/Insights profiling pass.

@@ -220,6 +220,39 @@ public:
 	}
 };
 
+// Multi-body collision response: repel particles of DIFFERENT bodies in a shared grid (SB-M9).
+class FSBInterBodyCollideCS : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSBInterBodyCollideCS);
+	SHADER_USE_PARAMETER_STRUCT(FSBInterBodyCollideCS, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float3>, PredictedIn)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, BodyIds)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, CellCounts)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CellParticles)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, PredictedOut)
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(uint32, TableSize)
+		SHADER_PARAMETER(float, CellSize)
+		SHADER_PARAMETER(float, Thickness)
+		SHADER_PARAMETER(float, SelfStiffness)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), kThreadGroupSize);
+		OutEnvironment.SetDefine(TEXT("MAX_PER_CELL"), kMaxPerCell);
+	}
+};
+
 // Mouse-drag grab: a single thread pulls one grabbed particle toward the cursor (SB-M3).
 class FSBGrabCS : public FGlobalShader
 {
@@ -340,6 +373,7 @@ IMPLEMENT_GLOBAL_SHADER(FSBSolveVolumeCS,   "/SoftBodySim/Private/SBSolveVolume.
 IMPLEMENT_GLOBAL_SHADER(FSBGrabCS,          "/SoftBodySim/Private/SBGrab.usf",          "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBBuildGridCS,     "/SoftBodySim/Private/SBBuildGrid.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBSelfCollisionCS, "/SoftBodySim/Private/SBSelfCollision.usf", "MainCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSBInterBodyCollideCS, "/SoftBodySim/Private/SBInterBodyCollide.usf", "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionCS,     "/SoftBodySim/Private/SBCollision.usf",     "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBCollisionDFCS,   "/SoftBodySim/Private/SBCollisionDF.usf",   "MainCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSBFinalizeCS,      "/SoftBodySim/Private/SBFinalize.usf",      "MainCS", SF_Compute);
@@ -802,6 +836,148 @@ void SoftBodyCompute::Dispatch_RenderThread(
 
 	// Kick a fresh readback of the committed positions for next frame's render verts.
 	AddEnqueueCopyPass(GraphBuilder, Resources->PositionReadback.Get(), Positions, sizeof(FVector3f) * Num);
+
+	GraphBuilder.Execute();
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Multi-body collision (SB-M9)
+//////////////////////////////////////////////////////////////////////////
+
+void SoftBodyCompute::DispatchInterBody_RenderThread(
+	FRHICommandListImmediate& RHICmdList,
+	const TArray<TSharedPtr<FSoftBodyRenderResources>>& Bodies,
+	float Thickness,
+	float Stiffness,
+	int32 Iterations)
+{
+	check(IsInRenderingThread());
+
+	if (Thickness <= 0.0f)
+	{
+		return;
+	}
+
+	// Collect the bodies that are actually ready, plus their offsets into the combined set.
+	struct FBodyRange { FSoftBodyRenderResources* Res; int32 Offset; int32 Count; };
+	TArray<FBodyRange> Ranges;
+	int32 Total = 0;
+	for (const TSharedPtr<FSoftBodyRenderResources>& B : Bodies)
+	{
+		if (B.IsValid() && B->bInitialized && B->NumParticles > 0 && B->PositionsBuffer.IsValid() && B->InvMassBuffer.IsValid())
+		{
+			Ranges.Add({ B.Get(), Total, B->NumParticles });
+			Total += B->NumParticles;
+		}
+	}
+	if (Ranges.Num() < 2 || Total <= 0)
+	{
+		return; // need at least two bodies to collide
+	}
+
+	FRDGBuilder GraphBuilder(RHICmdList);
+
+	// Combined particle buffers (transient — rebuilt every frame from the bodies' committed state).
+	const FRDGBufferDesc Float3Desc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector3f), Total);
+	const FRDGBufferDesc FloatDesc  = FRDGBufferDesc::CreateStructuredDesc(sizeof(float), Total);
+	const FRDGBufferDesc UintDesc   = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Total);
+	FRDGBufferRef CombinedA   = GraphBuilder.CreateBuffer(Float3Desc, TEXT("SoftBody.InterBody.PosA"));
+	FRDGBufferRef CombinedB   = GraphBuilder.CreateBuffer(Float3Desc, TEXT("SoftBody.InterBody.PosB"));
+	FRDGBufferRef CombinedInv = GraphBuilder.CreateBuffer(FloatDesc,  TEXT("SoftBody.InterBody.InvMass"));
+	FRDGBufferRef BodyIds     = GraphBuilder.CreateBuffer(UintDesc,   TEXT("SoftBody.InterBody.BodyIds"));
+
+	// Per-particle body index, uploaded from the CPU (small).
+	{
+		TArray<uint32> Ids;
+		Ids.SetNumUninitialized(Total);
+		for (int32 b = 0; b < Ranges.Num(); ++b)
+		{
+			for (int32 i = 0; i < Ranges[b].Count; ++i)
+			{
+				Ids[Ranges[b].Offset + i] = (uint32)b;
+			}
+		}
+		// Upload by creating an initialized buffer then copying into BodyIds (keeps one desc/UAV path).
+		FRDGBufferRef Uploaded = CreateStructuredBuffer(GraphBuilder, TEXT("SoftBody.InterBody.BodyIdsSrc"),
+			sizeof(uint32), Total, Ids.GetData(), sizeof(uint32) * Total);
+		AddCopyBufferPass(GraphBuilder, BodyIds, 0, Uploaded, 0, sizeof(uint32) * Total);
+	}
+
+	// Gather each body's committed Positions + InvMasses into the combined buffers.
+	for (const FBodyRange& R : Ranges)
+	{
+		FRDGBufferRef Pos = GraphBuilder.RegisterExternalBuffer(R.Res->PositionsBuffer, TEXT("SoftBody.InterBody.SrcPos"));
+		FRDGBufferRef Inv = GraphBuilder.RegisterExternalBuffer(R.Res->InvMassBuffer,  TEXT("SoftBody.InterBody.SrcInv"));
+		AddCopyBufferPass(GraphBuilder, CombinedA,   R.Offset * sizeof(FVector3f), Pos, 0, R.Count * sizeof(FVector3f));
+		AddCopyBufferPass(GraphBuilder, CombinedInv, R.Offset * sizeof(float),     Inv, 0, R.Count * sizeof(float));
+	}
+
+	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
+	TShaderMapRef<FSBBuildGridCS>          BuildGridCS(ShaderMap);
+	TShaderMapRef<FSBInterBodyCollideCS>   InterBodyCS(ShaderMap);
+
+	const FIntVector GroupCount = FComputeShaderUtils::GetGroupCount(Total, kThreadGroupSize);
+	const uint32 TableSize = NextPrime(2u * (uint32)Total);
+	FRDGBufferSRVRef BodyIdsSRV = GraphBuilder.CreateSRV(BodyIds);
+
+	FRDGBufferRef Cur = CombinedA;
+	const int32 Iters = FMath::Max(1, Iterations);
+	for (int32 It = 0; It < Iters; ++It)
+	{
+		FRDGBufferRef Other = (Cur == CombinedA) ? CombinedB : CombinedA;
+
+		const FRDGBufferDesc CountsDesc   = FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), TableSize);
+		const FRDGBufferDesc ParticleDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), TableSize * kMaxPerCell);
+		FRDGBufferRef CellCounts    = GraphBuilder.CreateBuffer(CountsDesc,   TEXT("SoftBody.InterBody.CellCounts"));
+		FRDGBufferRef CellParticles = GraphBuilder.CreateBuffer(ParticleDesc, TEXT("SoftBody.InterBody.CellParticles"));
+
+		FRDGBufferUAVRef CellCountsUAV = GraphBuilder.CreateUAV(CellCounts, PF_R32_UINT);
+		AddClearUAVPass(GraphBuilder, CellCountsUAV, 0u);
+
+		// Build the shared grid over all bodies' current positions.
+		{
+			FSBBuildGridCS::FParameters* P = GraphBuilder.AllocParameters<FSBBuildGridCS::FParameters>();
+			P->PredictedIn   = GraphBuilder.CreateSRV(Cur);
+			P->CellCounts    = CellCountsUAV;
+			P->CellParticles = GraphBuilder.CreateUAV(CellParticles);
+			P->NumParticles  = (uint32)Total;
+			P->TableSize     = TableSize;
+			P->CellSize      = Thickness;
+
+			FComputeShaderUtils::AddPass(GraphBuilder,
+				RDG_EVENT_NAME("SBInterBodyBuildGrid (iter %d)", It),
+				BuildGridCS, P, GroupCount);
+		}
+
+		// Repel particles of different bodies, writing the other buffer.
+		{
+			FSBInterBodyCollideCS::FParameters* P = GraphBuilder.AllocParameters<FSBInterBodyCollideCS::FParameters>();
+			P->PredictedIn   = GraphBuilder.CreateSRV(Cur);
+			P->InvMasses     = GraphBuilder.CreateSRV(CombinedInv);
+			P->BodyIds       = BodyIdsSRV;
+			P->CellCounts    = GraphBuilder.CreateSRV(CellCounts, PF_R32_UINT);
+			P->CellParticles = GraphBuilder.CreateSRV(CellParticles);
+			P->PredictedOut  = GraphBuilder.CreateUAV(Other);
+			P->NumParticles  = (uint32)Total;
+			P->TableSize     = TableSize;
+			P->CellSize      = Thickness;
+			P->Thickness     = Thickness;
+			P->SelfStiffness = Stiffness;
+
+			FComputeShaderUtils::AddPass(GraphBuilder,
+				RDG_EVENT_NAME("SBInterBodyCollide (iter %d)", It),
+				InterBodyCS, P, GroupCount);
+		}
+
+		Cur = Other;
+	}
+
+	// Copy the corrected positions back into each body's persistent Positions buffer.
+	for (const FBodyRange& R : Ranges)
+	{
+		FRDGBufferRef Pos = GraphBuilder.RegisterExternalBuffer(R.Res->PositionsBuffer, TEXT("SoftBody.InterBody.DstPos"));
+		AddCopyBufferPass(GraphBuilder, Pos, 0, Cur, R.Offset * sizeof(FVector3f), R.Count * sizeof(FVector3f));
+	}
 
 	GraphBuilder.Execute();
 }

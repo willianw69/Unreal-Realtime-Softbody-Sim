@@ -195,4 +195,29 @@ authored collider shapes, by sampling Unreal's Global Distance Field.
 scene geometry by sampling Unreal's Global Distance Field from a custom compute pass via a scene view
 extension."
 
+## SB-M9 — Multi-body collision ✅ 2026-06-24
+**Shipped:** Multiple soft body actors collide with and pile on each other (jelly-on-jelly), coordinated by
+a world subsystem running one shared GPU pass per frame.
+
+**Talking points:**
+- **Coordinating independent simulations:** each body sims in its own buffers/dispatch; a `UWorldSubsystem`
+  registers them and runs a single cross-body collision pass, designed as a *post-sim positional projection*
+  so it composes cleanly without restructuring any body's substep. A clean example of adding global behaviour
+  over per-object systems with minimal coupling.
+- **Reuse, again:** the cross-body pass is the self-collision spatial hash with one rule changed — repel
+  particles whose body-id differs instead of whose lattice cells are adjacent. Same race-free Jacobi gather,
+  same prime-sized hash grid. The framework's third reuse (cloth → soft body → self → inter-body).
+- **GPU buffer plumbing:** gather N bodies' separate pooled position buffers into a combined buffer via
+  RDG buffer-region copies, build/repel over the union with a per-particle body-id, then scatter corrections
+  back — all on the GPU, transient per frame, with render-thread-safe resource capture.
+
+**Resume bullet candidate:** "Added inter-body collision for multiple GPU soft bodies via a world subsystem
+that runs a shared spatial-hash repulsion pass over all bodies' particles each frame."
+
+## Project status
+M1–M9 complete: a from-scratch GPU tetrahedral-XPBD soft body in UE 5.7 (no Chaos) with volume preservation,
+mouse dragging, ground/sphere/capsule/self/distance-field/**multi-body** collision, custom-mesh embedding,
+and vertex-color weight-painted stiffness — all on a custom compute + RDG framework shared with a sibling
+cloth simulator. Remaining work is optional SB-M+ polish.
+
 <!-- Append SB-M+ / further sections below as work is completed. -->

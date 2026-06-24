@@ -224,6 +224,26 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "1", ClampMax = "8"))
 	int32 SelfCollisionIterations = 2;
 
+	/**
+	 * Collide this body against OTHER soft body actors (SB-M9). A world subsystem gathers all
+	 * bodies that opt in and runs a shared spatial-hash repulsion so different bodies push each
+	 * other apart (pile/squash together). Needs at least two bodies with this enabled.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision")
+	bool bInterBodyCollision = false;
+
+	/** Inter-body contact distance (cm): particles of different bodies kept at least this far apart. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.1", EditCondition = "bInterBodyCollision"))
+	float InterBodyThickness = 20.0f;
+
+	/** Inter-body repulsion strength [0..1]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bInterBodyCollision"))
+	float InterBodyStiffness = 1.0f;
+
+	/** Inter-body repulsion passes per frame. More = firmer separation in dense piles, more cost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Collision", meta = (ClampMin = "1", ClampMax = "8", EditCondition = "bInterBodyCollision"))
+	int32 InterBodyIterations = 2;
+
 	/** Substeps per frame. The biggest stability lever: more = stiffer, more stable. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Solver", meta = (ClampMin = "1", ClampMax = "16"))
 	int32 Substeps = 2;
@@ -306,6 +326,9 @@ public:
 	virtual int32 GetNumMaterials() const override { return 1; }
 	virtual UMaterialInterface* GetMaterial(int32 ElementIndex) const override;
 	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const override;
+
+	/** Render-thread sim state, shared with the world subsystem for inter-body collision (SB-M9). */
+	TSharedPtr<FSoftBodyRenderResources> GetRenderResources() const { return RenderResources; }
 
 protected:
 	virtual void BeginPlay() override;

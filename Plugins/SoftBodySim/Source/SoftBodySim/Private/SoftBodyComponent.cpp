@@ -4,6 +4,7 @@
 #include "SoftBodyResources.h"
 #include "SoftBodyMeshProxy.h"
 #include "SoftBodySceneViewExtension.h"     // GDF snapshot registration (SB-M8)
+#include "SoftBodyWorldSubsystem.h"         // inter-body collision registration (SB-M9)
 
 #include "DrawDebugHelpers.h"
 #include "DynamicMeshBuilder.h"            // FDynamicMeshVertex
@@ -53,6 +54,15 @@ void USoftBodyComponent::BeginPlay()
 				PC->bEnableClickEvents = true;
 				PC->bEnableMouseOverEvents = true;
 			}
+		}
+	}
+
+	// Register for inter-body collision coordination (SB-M9).
+	if (UWorld* World = GetWorld())
+	{
+		if (USoftBodyWorldSubsystem* Sub = World->GetSubsystem<USoftBodyWorldSubsystem>())
+		{
+			Sub->RegisterComponent(this);
 		}
 	}
 }
@@ -1276,6 +1286,15 @@ void USoftBodyComponent::DrawDebug()
 
 void USoftBodyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// Stop participating in inter-body collision before our resources are released (SB-M9).
+	if (UWorld* World = GetWorld())
+	{
+		if (USoftBodyWorldSubsystem* Sub = World->GetSubsystem<USoftBodyWorldSubsystem>())
+		{
+			Sub->UnregisterComponent(this);
+		}
+	}
+
 	if (RenderResources.IsValid())
 	{
 		ENQUEUE_RENDER_COMMAND(SoftBodySimRelease)(
