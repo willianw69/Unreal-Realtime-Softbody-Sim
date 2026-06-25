@@ -160,6 +160,11 @@ struct FSoftBodyRenderResources
 	int32 NumVolumeConstraints = 0;
 	TArray<FSoftBodyColorRange> VolumeColorRanges;
 
+	// Per-constraint "broken" flags for cutting (SB-M10): 1 = severed, skipped by the solve.
+	// Same indexing as the color-sorted constraint buffers. Zeroed at init; re-uploaded on a cut.
+	TRefCountPtr<FRDGPooledBuffer> DistanceBrokenBuffer;
+	TRefCountPtr<FRDGPooledBuffer> VolumeBrokenBuffer;
+
 	int32 NumParticles = 0;
 	bool  bInitialized = false;
 
@@ -202,6 +207,14 @@ namespace SoftBodyCompute
 		FRHICommandListImmediate& RHICmdList,
 		const TSharedPtr<FSoftBodyRenderResources>& Resources,
 		const FSoftBodyParams& Params);
+
+	/** Re-upload the per-constraint "broken" flags after a cut (SB-M10). Sizes must match
+	 *  the distance / volume constraint counts. */
+	void UpdateBrokenState_RenderThread(
+		FRHICommandListImmediate& RHICmdList,
+		const TSharedPtr<FSoftBodyRenderResources>& Resources,
+		const TArray<uint32>& DistanceBroken,
+		const TArray<uint32>& VolumeBroken);
 
 	/** Multi-body collision (SB-M9): a single post-sim positional correction over ALL
 	 *  participating bodies. Concatenates their committed Positions into a shared grid and

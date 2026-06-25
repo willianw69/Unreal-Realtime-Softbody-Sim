@@ -42,6 +42,7 @@ struct FVolumeConstraint
 
 StructuredBuffer<FVolumeConstraint>	VolumeConstraints;
 StructuredBuffer<float>				InvMasses;
+StructuredBuffer<uint>				Broken;		// per-tet cut flag (SB-M10): !=0 = removed
 RWStructuredBuffer<float3>			Positions;	// in/out (predicted positions, solved in place)
 
 uint	ColorStart;			// first constraint index of this color
@@ -58,7 +59,13 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
-	const FVolumeConstraint C = VolumeConstraints[ColorStart + Local];
+	const uint Index = ColorStart + Local;
+	if (Broken[Index] != 0)
+	{
+		return; // cut (SB-M10): this tet no longer preserves volume
+	}
+
+	const FVolumeConstraint C = VolumeConstraints[Index];
 
 	const float w0 = InvMasses[C.I0];
 	const float w1 = InvMasses[C.I1];

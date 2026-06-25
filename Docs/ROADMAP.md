@@ -1,7 +1,7 @@
 # ROADMAP.md
 
 > Project progress tracker. ✅ Completed · 🔄 In Progress · ⏳ Planned
-> Last updated: 2026-06-24 (SB-M9 multi-body collision).
+> Last updated: 2026-06-25 (SB-M10 interactive cutting + bActive toggle; SB-M11 queued).
 
 | Milestone | Title | Status |
 |---|---|---|
@@ -15,7 +15,9 @@
 | SB-M7 | XPBD compliance (distance solve) | ✅ |
 | SB-M8 | Distance-field collision (Global Distance Field) | ✅ |
 | SB-M9 | Multi-body collision (shared spatial hash) | ✅ |
-| SB-M+ | Per-mesh/custom SDF colliders, conforming cage, XPBD volume, render-mesh skinning, zero-copy verts, profiling | ⏳ (stretch) |
+| SB-M10 | Interactive cutting + visual split (lattice) | ✅ |
+| SB-M11 | Cuttable custom meshes (render-mesh splitting) | ⏳ (next) |
+| SB-M+ | Per-mesh/custom SDF colliders, conforming cage, XPBD volume, render-mesh skinning, profiling | ⏳ (stretch) |
 
 ## Notes per Milestone
 
@@ -111,6 +113,26 @@ body's Positions buffer. A post-sim positional projection, so each body's subste
 body via `bInterBodyCollision` (+ `InterBodyThickness`/`InterBodyStiffness`/`InterBodyIterations`; the
 subsystem uses the max across participants). Bodies pile/squash together. ~1-frame lag (acceptable for soft
 contact); particle-level so resolution tracks cage density.
+
+### SB-M10 — Interactive cutting + visual split ✅ (verified in-editor 2026-06-25)
+Right-click-drag a stroke to slice a **box/lattice** body: the swipe defines a plane (through the camera,
+spanning the start + end rays), and every distance/volume constraint crossing it is severed so the body
+splits into independent chunks. Mechanism: per-constraint **broken** flags (`DistanceBrokenBuffer`/
+`VolumeBrokenBuffer`, zeroed at init) that the three solve shaders skip; the cut is tested CPU-side from the
+readback positions, the flags re-uploaded (`UpdateBrokenState_RenderThread`), and the surface re-extracted
+from the surviving tets' boundary faces (`BuildTetBoundarySurface`, faces used by exactly one un-cut tet) with
+a dynamic index buffer (`FSoftBodyMeshSceneProxy::UpdateIndices_RenderThread`) so new cut faces appear. Cuts
+accumulate; coarse cages give chunkier cut faces. **Lattice only** — an embedded Source Mesh tears physically
+but its surface stretches at the seam (clean mesh cutting is SB-M11). Also added a component **`bActive`**
+master switch (evaluated at BeginPlay) to disable specific actors for testing.
+
+### SB-M11 — Cuttable custom meshes ⏳ (next)
+Extend SB-M10's cut to **embedded Source Meshes** so the render mesh opens cleanly, not just the cage. The
+cage already separates physically (constraints break); what's missing is **splitting the render mesh's
+triangles along the cut plane**: for triangles straddling the plane, duplicate vertices along the seam,
+retriangulate the two sides, generate the new cut-face geometry, and re-embed the new verts into the cage
+tets (barycentric). Edge cases: UV/normal seams, multiple accumulating cuts, verts exactly on the plane.
+Meaty — worth a plan pass before implementing.
 
 ### SB-M+ — Stretch ⏳
 Higher-fidelity colliders than the GDF for a specific mesh (custom baked SDF / per-mesh distance field);

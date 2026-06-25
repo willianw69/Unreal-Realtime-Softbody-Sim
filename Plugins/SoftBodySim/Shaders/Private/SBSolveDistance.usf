@@ -40,6 +40,7 @@ struct FConstraint
 
 StructuredBuffer<FConstraint>	Constraints;
 StructuredBuffer<float>			InvMasses;
+StructuredBuffer<uint>			Broken;		// per-constraint cut flag (SB-M10): !=0 = severed
 RWStructuredBuffer<float3>		Positions;	// in/out (predicted positions, solved in place)
 
 uint	ColorStart;		// first constraint index of this color
@@ -55,7 +56,13 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
-	const FConstraint C = Constraints[ColorStart + Local];
+	const uint Index = ColorStart + Local;
+	if (Broken[Index] != 0)
+	{
+		return; // cut (SB-M10): this edge no longer constrains
+	}
+
+	const FConstraint C = Constraints[Index];
 
 	const float Wa = InvMasses[C.IndexA];
 	const float Wb = InvMasses[C.IndexB];

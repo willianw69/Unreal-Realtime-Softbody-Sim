@@ -44,6 +44,10 @@ public:
 		const TArray<FVector3f>& Normals,
 		const TArray<FVector3f>& Tangents);
 
+	/** Replace the index buffer (topology change from a cut, SB-M10). Reallocates the
+	 *  index buffer since the triangle count changes. */
+	void UpdateIndices_RenderThread(const TArray<uint32>& NewIndices);
+
 	virtual void GetDynamicMeshElements(
 		const TArray<const FSceneView*>& Views,
 		const FSceneViewFamily& ViewFamily,

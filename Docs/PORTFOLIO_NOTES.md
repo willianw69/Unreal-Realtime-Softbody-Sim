@@ -214,10 +214,34 @@ a world subsystem running one shared GPU pass per frame.
 **Resume bullet candidate:** "Added inter-body collision for multiple GPU soft bodies via a world subsystem
 that runs a shared spatial-hash repulsion pass over all bodies' particles each frame."
 
-## Project status
-M1–M9 complete: a from-scratch GPU tetrahedral-XPBD soft body in UE 5.7 (no Chaos) with volume preservation,
-mouse dragging, ground/sphere/capsule/self/distance-field/**multi-body** collision, custom-mesh embedding,
-and vertex-color weight-painted stiffness — all on a custom compute + RDG framework shared with a sibling
-cloth simulator. Remaining work is optional SB-M+ polish.
+## SB-M10 — Interactive cutting + visual split ✅ 2026-06-25
+**Shipped:** Slice a soft body with a right-mouse swipe — it splits into separate jiggling chunks and the cut
+surface opens up live. The most involved milestone: a topology change at runtime.
 
-<!-- Append SB-M+ / further sections below as work is completed. -->
+**Talking points:**
+- **Runtime topology change on a GPU sim:** the body holds together purely through its constraints, so
+  "cutting" = flagging the constraints crossing a plane as broken (the solve shaders skip them) and the pieces
+  fall apart naturally — no re-simulation, no re-init. A clean demonstration of *why* a constraint-based
+  formulation makes fracture cheap.
+- **Live surface re-extraction:** the rendered surface is rebuilt from the surviving tetrahedra each cut
+  (a face used by exactly one un-cut tet is boundary), so interior faces exposed by removed tets become the
+  visible cut surface — pushed to the GPU through a dynamic index buffer. This is the bulk of the work and the
+  part that makes the cut *look* real.
+- **Reuse end-to-end:** the solve passes only gained a skip; the resulting chunks interact through the existing
+  self-collision; the cut plane is tested CPU-side from the same position readback that drives rendering and
+  mouse picking. Only the scene proxy gained a new capability (mutable index buffer).
+- **Honest scope line:** clean visual cutting targets the lattice/box bodies; cutting an embedded custom mesh
+  needs render-mesh triangle splitting (queued as SB-M11) — a good example of scoping an ambitious feature to a
+  shippable slice and naming the follow-up.
+
+**Resume bullet candidate:** "Implemented interactive cutting of a GPU soft body — severing constraints along a
+swipe plane and re-extracting the boundary surface from the surviving tetrahedra with a dynamic index buffer so
+the body splits into separate pieces in real time."
+
+## Project status
+M1–M10 complete: a from-scratch GPU tetrahedral-XPBD soft body in UE 5.7 (no Chaos) with volume preservation,
+mouse dragging, ground/sphere/capsule/self/distance-field/multi-body collision, custom-mesh embedding,
+vertex-color weight-painted stiffness, and **interactive cutting/splitting** — all on a custom compute + RDG
+framework shared with a sibling cloth simulator. Next: SB-M11 (cuttable custom meshes), then SB-M+ polish.
+
+<!-- Append SB-M11 / further sections below as work is completed. -->

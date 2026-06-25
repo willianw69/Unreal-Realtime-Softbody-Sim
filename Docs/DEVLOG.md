@@ -337,4 +337,44 @@ conforming cage, XPBD volume, render-mesh skinning upgrade, inter-body broadphas
 
 ---
 
-<!-- Append SB-M+ / further entries below after each is implemented + verified in-editor. -->
+## 2026-06-25 — SB-M10: interactive cutting + visual split (lattice) + bActive
+**What:** Box/lattice soft bodies are now cuttable. Right-mouse-drag a stroke → on release the swipe forms a
+plane (through the camera, spanning the press + release rays) and every constraint crossing it is severed, so
+the body splits into independent chunks with the cut surface opening up.
+
+Mechanism:
+- Per-constraint **broken** flags: `DistanceBrokenBuffer` + `VolumeBrokenBuffer` (uint, zeroed at init,
+  always created). The three solve shaders (`SBSolveDistance`, `SBSolveDistanceXPBD`, `SBSolveVolume`) read
+  `Broken[ColorStart+Local]` and early-out — a severed edge/tet stops constraining.
+- Cut (`USoftBodyComponent::UpdateCut`, CPU): poll RMB; press records the start ray, release builds the plane
+  (`n = normalize(cross(startDir, endDir))`, point = camera pos). Under the readback lock, every distance
+  constraint whose endpoints straddle the plane and every tet that straddles it are marked broken in CPU
+  mirror arrays (`DistanceConstraintsCPU`/`VolumeConstraintsCPU` kept since init). Flags re-uploaded via
+  `SoftBodyCompute::UpdateBrokenState_RenderThread`.
+- Visual split: `BuildTetBoundarySurface` re-extracts the render surface from the **surviving** tets — a face
+  used by exactly one un-cut tet is boundary (interior faces exposed by removed tets become the cut surface),
+  oriented outward via the opposite vertex. The new index buffer is pushed with a dynamic
+  `FSoftBodyMeshSceneProxy::UpdateIndices_RenderThread` (reallocates the index buffer; NumPrimitives re-read
+  each frame). Box mode now uses tet-boundary extraction when `bCuttable` (uncut = the full box surface).
+- Props: `bCuttable` (lattice only). Also added **`bActive`** — a component master switch evaluated at
+  BeginPlay (skips init/sim/render/inter-body registration) so specific actors can be disabled for testing.
+
+**Why:** "Make it cuttable like real slime." Breaking constraints is the physical mechanism; the bulk of the
+work is the live surface re-extraction so the cut is visible. Reused the existing solve passes (just a skip),
+the self-collision hash for the resulting chunks, and the readback for the CPU plane test — only the proxy
+gained a dynamic index buffer.
+
+**Problems & solutions:** None at build. Constraint break flags are indexed in the color-sorted buffer order,
+so the cut test iterates the same CPU mirror arrays and writes matching slots. Cutting embedded custom meshes
+is intentionally out of scope (the skinned render mesh would need triangle-level splitting) — queued as SB-M11.
+Builds were briefly blocked by the open editor (header + new-shader changes need a full rebuild, not Live Coding).
+
+**Performance:** Solve adds one uint read per constraint (negligible). A cut is a CPU O(constraints) plane test
++ one broken re-upload + one CPU boundary re-extraction (O(tets)) + an index-buffer realloc — all one-shot on
+the user action, not per frame.
+
+**Next:** SB-M11 — extend cutting to embedded custom meshes (split the render mesh's triangles along the cut).
+
+---
+
+<!-- Append SB-M11 / further entries below after each is implemented + verified in-editor. -->

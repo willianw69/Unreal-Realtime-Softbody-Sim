@@ -80,6 +80,7 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUConstraint>, Constraints)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Broken)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, Positions)
 		SHADER_PARAMETER(uint32, ColorStart)
 		SHADER_PARAMETER(uint32, ColorCount)
@@ -108,6 +109,7 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUConstraint>, Constraints)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Broken)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, Positions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, Lambdas)
 		SHADER_PARAMETER(uint32, ColorStart)
@@ -139,6 +141,7 @@ public:
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUVolumeConstraint>, VolumeConstraints)
 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InvMasses)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Broken)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, Positions)
 		SHADER_PARAMETER(uint32, ColorStart)
 		SHADER_PARAMETER(uint32, ColorCount)
@@ -456,10 +459,60 @@ void SoftBodyCompute::InitResources_RenderThread(
 		GraphBuilder.QueueBufferExtraction(VolumeBuf, &Resources->VolumeConstraintsBuffer);
 	}
 
+	// Per-constraint "broken" flags for cutting (SB-M10), zeroed (nothing cut yet). Always
+	// created (even for non-cuttable bodies) so the solve can bind them unconditionally.
+	{
+		const int32 NumDist = FMath::Max(1, Constraints.Num());
+		TArray<uint32> ZeroDist; ZeroDist.Init(0u, NumDist);
+		FRDGBufferRef DistBrokenBuf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.DistanceBroken"),
+			sizeof(uint32), NumDist, ZeroDist.GetData(), sizeof(uint32) * NumDist);
+		GraphBuilder.QueueBufferExtraction(DistBrokenBuf, &Resources->DistanceBrokenBuffer);
+
+		const int32 NumVol = FMath::Max(1, VolumeConstraints.Num());
+		TArray<uint32> ZeroVol; ZeroVol.Init(0u, NumVol);
+		FRDGBufferRef VolBrokenBuf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.VolumeBroken"),
+			sizeof(uint32), NumVol, ZeroVol.GetData(), sizeof(uint32) * NumVol);
+		GraphBuilder.QueueBufferExtraction(VolBrokenBuf, &Resources->VolumeBrokenBuffer);
+	}
+
 	GraphBuilder.Execute();
 
 	Resources->PositionReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("SoftBody.PositionReadback"));
 	Resources->bInitialized = true;
+}
+
+void SoftBodyCompute::UpdateBrokenState_RenderThread(
+	FRHICommandListImmediate& RHICmdList,
+	const TSharedPtr<FSoftBodyRenderResources>& Resources,
+	const TArray<uint32>& DistanceBroken,
+	const TArray<uint32>& VolumeBroken)
+{
+	check(IsInRenderingThread());
+	if (!Resources.IsValid() || !Resources->bInitialized)
+	{
+		return;
+	}
+
+	FRDGBuilder GraphBuilder(RHICmdList);
+
+	if (DistanceBroken.Num() > 0)
+	{
+		FRDGBufferRef Buf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.DistanceBroken"),
+			sizeof(uint32), DistanceBroken.Num(), DistanceBroken.GetData(), sizeof(uint32) * DistanceBroken.Num());
+		GraphBuilder.QueueBufferExtraction(Buf, &Resources->DistanceBrokenBuffer);
+	}
+	if (VolumeBroken.Num() > 0)
+	{
+		FRDGBufferRef Buf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.VolumeBroken"),
+			sizeof(uint32), VolumeBroken.Num(), VolumeBroken.GetData(), sizeof(uint32) * VolumeBroken.Num());
+		GraphBuilder.QueueBufferExtraction(Buf, &Resources->VolumeBrokenBuffer);
+	}
+
+	GraphBuilder.Execute();
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -561,6 +614,20 @@ void SoftBodyCompute::Dispatch_RenderThread(
 		VolumeSRV = GraphBuilder.CreateSRV(VolumeBuf);
 	}
 
+	// Per-constraint cut flags (SB-M10), bound to the solve passes so severed constraints are skipped.
+	FRDGBufferSRVRef DistBrokenSRV = nullptr;
+	if (bDoConstraints && Resources->DistanceBrokenBuffer.IsValid())
+	{
+		DistBrokenSRV = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(
+			Resources->DistanceBrokenBuffer, TEXT("SoftBody.DistanceBroken")));
+	}
+	FRDGBufferSRVRef VolBrokenSRV = nullptr;
+	if (bDoVolume && Resources->VolumeBrokenBuffer.IsValid())
+	{
+		VolBrokenSRV = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(
+			Resources->VolumeBrokenBuffer, TEXT("SoftBody.VolumeBroken")));
+	}
+
 	FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 	TShaderMapRef<FSBPredictCS>           PredictCS(ShaderMap);
 	TShaderMapRef<FSBSolveDistanceCS>     SolveCS(ShaderMap);
@@ -646,6 +713,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 							FSBSolveDistanceXPBDCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceXPBDCS::FParameters>();
 							P->Constraints       = ConstraintsSRV;
 							P->InvMasses         = InvMassesSRV;
+							P->Broken            = DistBrokenSRV;
 							P->Positions         = GraphBuilder.CreateUAV(Solved);
 							P->Lambdas           = GraphBuilder.CreateUAV(LambdaDist, PF_R32_FLOAT);
 							P->ColorStart        = (uint32)Range.Start;
@@ -663,6 +731,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 							FSBSolveDistanceCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveDistanceCS::FParameters>();
 							P->Constraints = ConstraintsSRV;
 							P->InvMasses   = InvMassesSRV;
+							P->Broken      = DistBrokenSRV;
 							P->Positions   = GraphBuilder.CreateUAV(Solved);
 							P->ColorStart  = (uint32)Range.Start;
 							P->ColorCount  = (uint32)Range.Count;
@@ -688,6 +757,7 @@ void SoftBodyCompute::Dispatch_RenderThread(
 						FSBSolveVolumeCS::FParameters* P = GraphBuilder.AllocParameters<FSBSolveVolumeCS::FParameters>();
 						P->VolumeConstraints = VolumeSRV;
 						P->InvMasses         = InvMassesSRV;
+						P->Broken            = VolBrokenSRV;
 						P->Positions         = GraphBuilder.CreateUAV(Solved);
 						P->ColorStart        = (uint32)Range.Start;
 						P->ColorCount        = (uint32)Range.Count;

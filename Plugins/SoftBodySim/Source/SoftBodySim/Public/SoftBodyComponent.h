@@ -86,6 +86,14 @@ class SOFTBODYSIM_API USoftBodyComponent : public UMeshComponent
 public:
 	USoftBodyComponent();
 
+	/**
+	 * Master on/off (evaluated at BeginPlay). When false, this body does not initialize,
+	 * simulate, render, or participate in inter-body collision — handy for placing several
+	 * actors in a level and disabling some for testing. Set it before pressing Play.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody")
+	bool bActive = true;
+
 	/** Lattice/cage particle counts along each axis (X, Y, Z) — sets the cage deformation
 	 *  resolution (NOT the rendered mesh's poly count). High values get expensive fast
 	 *  (particles ~ X·Y·Z, plus a one-time init cost for weight transfer / embedding). */
@@ -290,6 +298,16 @@ public:
 	int32 MaxStepsPerFrame = 4;
 
 	/**
+	 * Make the body cuttable (SB-M10): RIGHT-click and drag a stroke to slice it — every
+	 * constraint crossing the swipe plane is severed and the body splits into separate
+	 * jiggling chunks, with the cut surface re-extracted live. Box/lattice bodies only
+	 * (tetrahedral boundary extraction); an embedded Source Mesh tears physically but its
+	 * surface won't re-close cleanly at the seam. Built at BeginPlay.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "SoftBody|Cutting")
+	bool bCuttable = false;
+
+	/**
 	 * Left-click and drag to grab the nearest surface point and pull the body around
 	 * (SB-M3). Enables the mouse cursor at BeginPlay. Picking + dragging are CPU-side
 	 * (from the position readback); a GPU pass pulls the grabbed particle to the cursor.
@@ -344,6 +362,14 @@ private:
 
 	/** Build the static boundary-surface triangle list + UVs (the 6 outer faces). */
 	void BuildBoundarySurface();
+
+	/** Build the render surface from the SURVIVING tetrahedra's boundary faces (faces used by
+	 *  exactly one un-cut tet). Used for cuttable box bodies so a cut opens up new faces (SB-M10). */
+	void BuildTetBoundarySurface();
+
+	/** Poll RIGHT-mouse: drag a stroke to define a cut plane, then sever every constraint
+	 *  crossing it and re-extract the surface (SB-M10). */
+	void UpdateCut();
 
 	/** Derive deduped distance constraints from the tet edges and greedily graph-color
 	 *  them, producing a color-sorted buffer + per-color ranges. */
@@ -453,6 +479,18 @@ private:
 	int32 NumColorsBuilt = 0;
 	int32 NumVolumeConstraintsBuilt = 0;
 	int32 NumVolumeColorsBuilt = 0;
+
+	// --- Cutting (SB-M10) -------------------------------------------------
+	// CPU mirrors of the color-sorted constraint buffers, kept so a cut can test each
+	// constraint's geometry and mark it broken (same indexing as the GPU buffers).
+	TArray<FGPUConstraint>       DistanceConstraintsCPU;
+	TArray<FGPUVolumeConstraint> VolumeConstraintsCPU;
+	TArray<uint32>               DistanceBrokenCPU;  // 1 = severed
+	TArray<uint32>               VolumeBrokenCPU;    // 1 = removed tet
+	// Right-mouse cut-stroke state.
+	bool    bCutStrokeActive = false;
+	FVector CutStrokeStartOrigin = FVector::ZeroVector;
+	FVector CutStrokeStartDir = FVector::ZeroVector;
 
 	FBoxSphereBounds LocalBounds = FBoxSphereBounds(ForceInit);
 

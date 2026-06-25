@@ -1,7 +1,7 @@
 # PROJECT_STATE.md
 
 > Single source of truth for current project status. Update after every milestone.
-> Last updated: 2026-06-24 (SB-M9 multi-body collision via a world subsystem + shared spatial hash).
+> Last updated: 2026-06-25 (SB-M10 interactive cutting + visual split + bActive toggle; SB-M11 queued).
 
 ## Project Overview
 Real-time **GPU soft body simulation built from scratch** in **Unreal Engine 5.7**, as a
@@ -24,12 +24,11 @@ constraints** · **mouse dragging** · **volume preservation (jelly)** · UE 5.7
 similar to Obi/Zibra soft body.
 
 ## Current Milestone
-**SB-M9 — Multi-body collision: COMPLETE + verified in-editor (2026-06-24).** Multiple soft body actors now
-collide with each other: a `USoftBodyWorldSubsystem` gathers all opted-in bodies and runs one shared
-spatial-hash repulsion pass per frame so particles of different bodies push apart (bodies pile/squash
-together). With M1–M9 the sim covers everything requested — GPU jelly, volume, drag, ground/shape/self/
-arbitrary-mesh/multi-body collision, custom-mesh embedding, weight-painted stiffness, XPBD. Remaining is
-SB-M+ stretch polish.
+**SB-M10 — Interactive cutting + visual split: COMPLETE + verified in-editor (2026-06-25).** Right-click-drag
+to slice a box/lattice soft body: constraints crossing the swipe plane sever and the body splits into chunks
+with the cut surface re-extracted live (new faces appear). Also added a component `bActive` master switch to
+disable specific actors for testing. Clean visual cutting is lattice-only; cutting embedded custom meshes is
+queued as SB-M11. With M1–M10 the sim covers everything requested plus interactive cutting.
 
 ## Completed Milestones
 - **M0 — Bootstrap.** UE 5.7 C++ host project `SoftBodyDemo` (BuildSettings V6, DX12,
@@ -80,12 +79,18 @@ SB-M+ stretch polish.
   grid (`SBBuildGrid.usf`), repel different-body particles (`SBInterBodyCollide.usf` + `FSBInterBodyCollideCS`),
   copy corrections back. Per-body opt-in props `bInterBodyCollision`/`InterBodyThickness`/`InterBodyStiffness`/
   `InterBodyIterations`; component exposes `GetRenderResources()` for the subsystem.
+- **SB-M10 — Interactive cutting.** Per-constraint broken flags (`DistanceBrokenBuffer`/`VolumeBrokenBuffer`,
+  zeroed at init) skipped by the three solve shaders; right-mouse swipe → cut plane → CPU plane-test marks
+  crossing constraints broken (`UpdateCut`) → re-upload (`UpdateBrokenState_RenderThread`) → surface
+  re-extracted from surviving tets (`BuildTetBoundarySurface`) → dynamic index buffer
+  (`UpdateIndices_RenderThread`). Prop `bCuttable` (lattice only). Plus a `bActive` master switch on the
+  component (BeginPlay gate) to disable actors for testing.
 
 ## Next Milestone
-**SB-M+ (stretch).** The sim covers all requested features. Optional depth: higher-fidelity colliders for a
-specific mesh (custom baked SDF / per-mesh DF, vs the coarser scene GDF); conforming non-box cage; higher-
-quality render-mesh skinning; XPBD for the volume solve; broadphase for many inter-body bodies; zero-copy GPU
-vertex write; a `stat GPU`/Unreal Insights profiling pass. See `ROADMAP.md`. No milestone is currently in progress.
+**SB-M11 — Cuttable custom meshes (queued).** Extend SB-M10's cut to embedded Source Meshes: split the render
+mesh's triangles along the cut plane (seam vertices, retriangulation, new cut-face geometry, re-embed into the
+cage tets) so the mesh opens cleanly, not just the cage. Meaty — plan before implementing. After that, the
+SB-M+ stretch list (custom SDF colliders, conforming cage, XPBD volume, profiling, etc.). See `ROADMAP.md`.
 
 ## Technical Decisions
 - **Method:** tetrahedral XPBD — a particle lattice filled with tetrahedra; solve **distance**

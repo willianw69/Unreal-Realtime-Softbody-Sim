@@ -1,7 +1,7 @@
 # ARCHITECTURE.md
 
 > Technical system documentation. Update whenever the architecture changes.
-> Last updated: 2026-06-24 (SB-M1–M9 — adds multi-body collision via a world subsystem + shared spatial hash).
+> Last updated: 2026-06-25 (SB-M1–M10 — adds interactive cutting: breakable constraints + live surface re-extraction).
 > Reference implementation for the reused framework: `E:\ClaudeCode\RT_ClothSim` (plugin `ClothSim`).
 
 **Status note (through SB-M7):** the SB-M1–M4 core (lattice, 6-tet Kuhn split, distance + per-tet volume
@@ -26,6 +26,11 @@ render) is all implemented, plus three additions:
   InvMasses + body-id into combined buffers, build a shared hash grid (`SBBuildGrid.usf`), repel different-body
   particles (`SBInterBodyCollide.usf`), copy corrections back to each body's Positions. A post-sim positional
   projection; per-body substeps untouched.
+- **Interactive cutting (SB-M10):** per-constraint broken flags (`DistanceBrokenBuffer`/`VolumeBrokenBuffer`)
+  the solve shaders skip; a right-mouse swipe → cut plane → CPU plane-test marks crossing constraints broken,
+  re-uploaded via `UpdateBrokenState_RenderThread`; the render surface is re-extracted from surviving tets
+  (`BuildTetBoundarySurface`) and pushed through a dynamic index buffer (`UpdateIndices_RenderThread`).
+  Lattice/box only; embedded-mesh cutting is SB-M11. A `bActive` component switch (BeginPlay) disables a body.
 
 Actual per-substep pipeline:
 `SBPredict → [colored-GS distance (XPBD or PBD) + colored-GS volume]×iters → [self-collision build+respond

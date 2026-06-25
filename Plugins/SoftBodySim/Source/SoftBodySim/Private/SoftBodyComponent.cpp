@@ -34,6 +34,13 @@ void USoftBodyComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// Master switch (evaluated here): leave the body completely inert when disabled — no
+	// sim resources, no proxy, no inter-body registration. Set bActive before Play.
+	if (!bActive)
+	{
+		return;
+	}
+
 	// Register the view extension that snapshots the Global Distance Field (SB-M8).
 	SoftBodyGDF::EnsureRegistered();
 
@@ -201,6 +208,94 @@ void USoftBodyComponent::BuildBoundarySurface()
 				(uint32)LatticeIndex(ResX - 1, Y + 1, Z + 1),
 				(uint32)LatticeIndex(ResX - 1, Y,     Z + 1),
 				FVector3f(1, 0, 0));
+		}
+	}
+}
+
+void USoftBodyComponent::BuildTetBoundarySurface()
+{
+	Triangles.Reset();
+
+	// Planar UVs per particle (built once; same convention as the box surface).
+	if (UV0.Num() != NumParticles)
+	{
+		UV0.SetNumUninitialized(NumParticles);
+		for (int32 i = 0; i < NumParticles; ++i)
+		{
+			const int32 X = i % ResX;
+			const int32 Y = (i / ResX) % ResY;
+			UV0[i] = FVector2f(
+				(ResX > 1) ? (float)X / (float)(ResX - 1) : 0.0f,
+				(ResY > 1) ? (float)Y / (float)(ResY - 1) : 0.0f);
+		}
+	}
+
+	// A face shared by two surviving tets is interior; a face used by exactly one surviving
+	// tet is on the boundary. Cutting removes (breaks) tets, so faces that were interior
+	// become boundary → the cut surface appears. Key = sorted vertex triple.
+	const int64 K = FMath::Max(1, NumParticles);
+	auto FaceKey = [K](uint32 a, uint32 b, uint32 c) -> uint64
+	{
+		uint32 s0 = a, s1 = b, s2 = c;
+		if (s0 > s1) Swap(s0, s1);
+		if (s1 > s2) Swap(s1, s2);
+		if (s0 > s1) Swap(s0, s1);
+		return ((uint64)s0 * (uint64)K + (uint64)s1) * (uint64)K + (uint64)s2;
+	};
+
+	struct FFaceRec { uint32 A, B, C, Opp; int32 Count; };
+	TMap<uint64, FFaceRec> Faces;
+	Faces.Reserve(VolumeConstraintsCPU.Num() * 4);
+
+	auto AddFace = [&](uint32 a, uint32 b, uint32 c, uint32 opp)
+	{
+		const uint64 Key = FaceKey(a, b, c);
+		if (FFaceRec* Rec = Faces.Find(Key))
+		{
+			Rec->Count++;
+		}
+		else
+		{
+			Faces.Add(Key, FFaceRec{ a, b, c, opp, 1 });
+		}
+	};
+
+	for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
+	{
+		if (VolumeBrokenCPU.IsValidIndex(t) && VolumeBrokenCPU[t] != 0)
+		{
+			continue; // removed tet
+		}
+		const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
+		AddFace(V.I1, V.I2, V.I3, V.I0);
+		AddFace(V.I0, V.I2, V.I3, V.I1);
+		AddFace(V.I0, V.I1, V.I3, V.I2);
+		AddFace(V.I0, V.I1, V.I2, V.I3);
+	}
+
+	Triangles.Reserve(Faces.Num() * 3);
+	for (const TPair<uint64, FFaceRec>& It : Faces)
+	{
+		const FFaceRec& F = It.Value;
+		if (F.Count != 1)
+		{
+			continue; // interior face (shared by two surviving tets)
+		}
+
+		// Orient so the smooth normal (Cross(E2,E1) = cross(pc-pa, pb-pa)) points AWAY from
+		// the tet's opposite vertex (outward). Use rest positions for a stable winding.
+		const FVector3f Pa = InitialLocalPositions[F.A];
+		const FVector3f Pb = InitialLocalPositions[F.B];
+		const FVector3f Pc = InitialLocalPositions[F.C];
+		const FVector3f FaceN = FVector3f::CrossProduct(Pc - Pa, Pb - Pa);
+		const FVector3f Outward = ((Pa + Pb + Pc) / 3.0f) - InitialLocalPositions[F.Opp];
+		if (FVector3f::DotProduct(FaceN, Outward) >= 0.0f)
+		{
+			Triangles.Add(F.A); Triangles.Add(F.B); Triangles.Add(F.C);
+		}
+		else
+		{
+			Triangles.Add(F.A); Triangles.Add(F.C); Triangles.Add(F.B);
 		}
 	}
 }
@@ -760,7 +855,6 @@ void USoftBodyComponent::InitializeSimulation()
 	}
 	else
 	{
-		BuildBoundarySurface();   // box-surface render geometry
 		ParticleWeights.Reset();
 		bHasWeightData = false;
 	}
@@ -788,6 +882,25 @@ void USoftBodyComponent::InitializeSimulation()
 	BuildVolumeConstraints(VolumeConstraints, VolumeColorRanges);
 	NumVolumeConstraintsBuilt = VolumeConstraints.Num();
 	NumVolumeColorsBuilt      = VolumeColorRanges.Num();
+
+	// Cutting (SB-M10): keep CPU mirrors of the constraints + zeroed broken flags, and (box
+	// mode) extract the render surface from the tets so a cut can open new faces.
+	DistanceConstraintsCPU = Constraints;
+	VolumeConstraintsCPU   = VolumeConstraints;
+	DistanceBrokenCPU.Init(0u, Constraints.Num());
+	VolumeBrokenCPU.Init(0u, VolumeConstraints.Num());
+
+	if (!bMeshMode)
+	{
+		if (bCuttable)
+		{
+			BuildTetBoundarySurface(); // surviving-tet boundary (initially the full box)
+		}
+		else
+		{
+			BuildBoundarySurface();    // fixed 6 box faces
+		}
+	}
 
 	RenderResources = MakeShared<FSoftBodyRenderResources>();
 
@@ -880,6 +993,12 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 
 	// Mouse pick/drag — updates GrabbedIndex / CurrentGrabTarget for the params below.
 	UpdateMouseGrab();
+
+	// Right-mouse cut stroke (SB-M10).
+	if (bCuttable)
+	{
+		UpdateCut();
+	}
 
 	FSoftBodyParams Params;
 	Params.NumParticles     = NumParticles;
@@ -1251,6 +1370,140 @@ void USoftBodyComponent::UpdateMouseGrab()
 	if (bIsGrabbing && GrabbedIndex != INDEX_NONE)
 	{
 		CurrentGrabTarget = RayOrigin + RayDir * GrabDepth;
+	}
+}
+
+void USoftBodyComponent::UpdateCut()
+{
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!PC || !RenderResources.IsValid())
+	{
+		bCutStrokeActive = false;
+		return;
+	}
+
+	const bool bDown = PC->IsInputKeyDown(EKeys::RightMouseButton);
+	FVector RayO, RayD;
+	const bool bRay = PC->DeprojectMousePositionToWorld(RayO, RayD);
+
+	// Press: record the stroke start ray.
+	if (bDown && !bCutStrokeActive)
+	{
+		if (bRay)
+		{
+			bCutStrokeActive = true;
+			CutStrokeStartOrigin = RayO;
+			CutStrokeStartDir = RayD.GetSafeNormal();
+		}
+		return;
+	}
+	// Held: draw a preview line from the stroke start to the current cursor point.
+	if (bDown && bCutStrokeActive)
+	{
+		if (bRay)
+		{
+			DrawDebugLine(World, CutStrokeStartOrigin + CutStrokeStartDir * 200.0f,
+				RayO + RayD.GetSafeNormal() * 200.0f, FColor::Red, false, -1.0f, SDPG_World, 1.0f);
+		}
+		return;
+	}
+	if (!bDown && !bCutStrokeActive)
+	{
+		return; // idle
+	}
+
+	// Release: form the cut plane (through the camera, containing the start + end rays) and slice.
+	bCutStrokeActive = false;
+	if (!bRay)
+	{
+		return;
+	}
+	const FVector EndDir = RayD.GetSafeNormal();
+	FVector Normal = FVector::CrossProduct(CutStrokeStartDir, EndDir);
+	if (Normal.SizeSquared() < 1e-6f)
+	{
+		return; // no real swipe (start ~ end) — ignore
+	}
+	Normal = Normal.GetSafeNormal();
+	const FVector PlanePoint = CutStrokeStartOrigin;
+
+	// Sever every constraint whose endpoints straddle the plane, using current world positions.
+	bool bAnyCut = false;
+	{
+		FScopeLock Lock(&RenderResources->PositionCopyCS);
+		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles)
+		{
+			return; // readback not ready
+		}
+		const TArray<FVector3f>& P = RenderResources->PositionCopy;
+
+		auto Side = [&](uint32 Idx) -> float
+		{
+			return FVector::DotProduct(FVector(P[Idx]) - PlanePoint, Normal);
+		};
+
+		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+		{
+			if (DistanceBrokenCPU[i] != 0)
+			{
+				continue;
+			}
+			const FGPUConstraint& C = DistanceConstraintsCPU[i];
+			if (Side(C.IndexA) * Side(C.IndexB) < 0.0f) // opposite sides → crosses the plane
+			{
+				DistanceBrokenCPU[i] = 1u;
+				bAnyCut = true;
+			}
+		}
+
+		for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
+		{
+			if (VolumeBrokenCPU[t] != 0)
+			{
+				continue;
+			}
+			const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
+			const float S0 = Side(V.I0), S1 = Side(V.I1), S2 = Side(V.I2), S3 = Side(V.I3);
+			const float MinS = FMath::Min(FMath::Min(S0, S1), FMath::Min(S2, S3));
+			const float MaxS = FMath::Max(FMath::Max(S0, S1), FMath::Max(S2, S3));
+			if (MinS < 0.0f && MaxS > 0.0f) // tet straddles the plane → remove it
+			{
+				VolumeBrokenCPU[t] = 1u;
+				bAnyCut = true;
+			}
+		}
+	}
+
+	if (!bAnyCut)
+	{
+		return;
+	}
+
+	// Push the new broken flags to the GPU solver.
+	{
+		TSharedPtr<FSoftBodyRenderResources> Resources = RenderResources;
+		ENQUEUE_RENDER_COMMAND(SoftBodyApplyCut)(
+			[Resources, Dist = DistanceBrokenCPU, Vol = VolumeBrokenCPU]
+			(FRHICommandListImmediate& RHICmdList)
+			{
+				SoftBodyCompute::UpdateBrokenState_RenderThread(RHICmdList, Resources, Dist, Vol);
+			});
+	}
+
+	// Re-extract the boundary surface so the cut opens up (box/lattice mode), and hand the
+	// new index buffer to the proxy. (Embedded meshes tear physically but aren't re-extracted.)
+	if (!bMeshMode)
+	{
+		BuildTetBoundarySurface();
+		if (FSoftBodyMeshSceneProxy* Proxy = static_cast<FSoftBodyMeshSceneProxy*>(SceneProxy))
+		{
+			ENQUEUE_RENDER_COMMAND(SoftBodyCutReindex)(
+				[Proxy, NewTris = Triangles](FRHICommandListImmediate& RHICmdList)
+				{
+					Proxy->UpdateIndices_RenderThread(NewTris);
+				});
+		}
 	}
 }
 

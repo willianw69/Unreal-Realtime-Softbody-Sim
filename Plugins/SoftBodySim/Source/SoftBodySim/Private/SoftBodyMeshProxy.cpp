@@ -97,6 +97,17 @@ void FSoftBodyMeshSceneProxy::UpdateVertices_RenderThread(
 	}
 }
 
+void FSoftBodyMeshSceneProxy::UpdateIndices_RenderThread(const TArray<uint32>& NewIndices)
+{
+	check(IsInRenderingThread());
+
+	// The triangle count changes on a cut, so reallocate the index buffer. NumPrimitives is
+	// re-read from IndexBuffer.Indices.Num() each frame in GetDynamicMeshElements, so it adapts.
+	IndexBuffer.ReleaseResource();
+	IndexBuffer.Indices = NewIndices;
+	IndexBuffer.InitResource(FRHICommandListImmediate::Get());
+}
+
 void FSoftBodyMeshSceneProxy::GetDynamicMeshElements(
 	const TArray<const FSceneView*>& Views,
 	const FSceneViewFamily& ViewFamily,
