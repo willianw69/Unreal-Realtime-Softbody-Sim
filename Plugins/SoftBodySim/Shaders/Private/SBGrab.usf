@@ -1,14 +1,15 @@
 // SBGrab.usf
 //
-// Mouse-drag grab (SB-M3). A single thread pulls one grabbed particle toward the
-// cursor's world-space target. Runs once per substep AFTER the constraint solve and
-// BEFORE collision, so the grabbed vertex is the solver's last word (and still gets
-// projected out of the ground). Neighbours follow over subsequent substeps via the
-// distance/volume constraints, giving a stretchy drag. Finalize derives velocity from
-// the position change, so the body keeps momentum when released.
+// Mouse-drag grab (SB-M3 + cluster grab). One thread per grabbed particle pulls it toward its
+// world-space target. The mouse drag grabs a whole REGION (a radius around the pick) so dragging
+// moves a patch of the body, not a single vertex; each particle's target is the cursor target
+// offset by its position within the region, so the patch translates rigidly. Runs once per substep
+// AFTER the constraint solve and BEFORE collision, so the grabbed vertices are the solver's last
+// word (and still get projected out of the ground). Neighbours follow over subsequent substeps via
+// the distance/volume constraints, giving a stretchy drag. Finalize derives velocity from the
+// position change, so the body keeps momentum when released.
 //
-// GrabStiffness near 1 = the vertex snaps to the cursor (firm pin); lower = a softer,
-// laggier attachment.
+// GrabStiffness near 1 = the vertices snap to their targets (firm pin); lower = a softer, laggier attachment.
 
 #include "/Engine/Public/Platform.ush"
 
@@ -16,15 +17,27 @@
 #define THREADGROUP_SIZE 64
 #endif
 
-RWStructuredBuffer<float3>	PredictedPositions;	// in/out (solved positions)
+// Must match FGPUGrab in SoftBodyResources.h (16 bytes: uint + float3, tight layout).
+struct FGrab
+{
+	uint   Index;
+	float3 Target;
+};
 
-uint	GrabIndex;		// particle to pull
-float3	GrabTarget;		// world-space cursor target
+RWStructuredBuffer<float3>	PredictedPositions;	// in/out (solved positions)
+StructuredBuffer<FGrab>		Grabs;				// grabbed particles + their targets
+uint	NumGrabs;
 float	GrabStiffness;	// [0,1] how hard to pull toward the target this substep
 
-[numthreads(1, 1, 1)]
+[numthreads(THREADGROUP_SIZE, 1, 1)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
-	const float3 P = PredictedPositions[GrabIndex];
-	PredictedPositions[GrabIndex] = lerp(P, GrabTarget, saturate(GrabStiffness));
+	const uint i = DispatchThreadId.x;
+	if (i >= NumGrabs)
+	{
+		return;
+	}
+	const FGrab G = Grabs[i];
+	const float3 P = PredictedPositions[G.Index];
+	PredictedPositions[G.Index] = lerp(P, G.Target, saturate(GrabStiffness));
 }

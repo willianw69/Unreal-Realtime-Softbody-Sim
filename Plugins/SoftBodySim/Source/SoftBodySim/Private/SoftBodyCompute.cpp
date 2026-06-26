@@ -265,8 +265,8 @@ public:
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float3>, PredictedPositions)
-		SHADER_PARAMETER(uint32, GrabIndex)
-		SHADER_PARAMETER(FVector3f, GrabTarget)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FGPUGrab>, Grabs)
+		SHADER_PARAMETER(uint32, NumGrabs)
 		SHADER_PARAMETER(float, GrabStiffness)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -647,9 +647,19 @@ void SoftBodyCompute::Dispatch_RenderThread(
 	const FSoftBodyGDFCache& GDFCache = SoftBodyGDF::Get();
 	const bool bDoDistanceField = Params.bUseDistanceFieldCollision && GDFCache.bValid;
 
-	const bool bDoGrab = Params.bGrabActive
-		&& Params.GrabIndex >= 0
-		&& Params.GrabIndex < Num;
+	const bool bDoGrab = Params.bGrabActive && Params.GrabPoints.Num() > 0;
+
+	// Grab points (region pulled toward the cursor) are constant within a frame; build once.
+	FRDGBufferSRVRef GrabsSRV = nullptr;
+	const int32 NumGrabs = Params.GrabPoints.Num();
+	if (bDoGrab)
+	{
+		FRDGBufferRef GrabsBuf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("SoftBody.Grabs"),
+			sizeof(FGPUGrab), NumGrabs,
+			Params.GrabPoints.GetData(), sizeof(FGPUGrab) * NumGrabs);
+		GrabsSRV = GraphBuilder.CreateSRV(GrabsBuf);
+	}
 
 	const bool bDoSelfCollision = Params.bSelfCollision && Params.SelfThickness > 0.0f;
 	const uint32 SelfTableSize = NextPrime(2u * (uint32)Num);
@@ -835,17 +845,17 @@ void SoftBodyCompute::Dispatch_RenderThread(
 			// --- Grab: pull the mouse-grabbed particle toward the cursor target ---
 			// After the solve (so it's the last word on that vertex), before collision (so
 			// it still can't be dragged through the ground).
-			if (bDoGrab)
+			if (bDoGrab && GrabsSRV)
 			{
 				FSBGrabCS::FParameters* P = GraphBuilder.AllocParameters<FSBGrabCS::FParameters>();
 				P->PredictedPositions = GraphBuilder.CreateUAV(Solved);
-				P->GrabIndex          = (uint32)Params.GrabIndex;
-				P->GrabTarget         = Params.GrabTarget;
+				P->Grabs              = GrabsSRV;
+				P->NumGrabs           = (uint32)NumGrabs;
 				P->GrabStiffness      = Params.GrabStiffness;
 
 				FComputeShaderUtils::AddPass(GraphBuilder,
 					RDG_EVENT_NAME("SBGrab (substep %d)", Step),
-					GrabCS, P, FIntVector(1, 1, 1));
+					GrabCS, P, FComputeShaderUtils::GetGroupCount(NumGrabs, 64));
 			}
 
 			// --- Collision: project predicted positions out of colliders + ground ---

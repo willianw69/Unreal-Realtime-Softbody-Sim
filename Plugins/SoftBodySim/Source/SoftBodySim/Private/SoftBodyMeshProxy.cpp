@@ -101,11 +101,17 @@ void FSoftBodyMeshSceneProxy::UpdateIndices_RenderThread(const TArray<uint32>& N
 {
 	check(IsInRenderingThread());
 
-	// The triangle count changes on a cut, so reallocate the index buffer. NumPrimitives is
+	// The triangle count changes on a cut/tear, so reallocate the index buffer. NumPrimitives is
 	// re-read from IndexBuffer.Indices.Num() each frame in GetDynamicMeshElements, so it adapts.
 	IndexBuffer.ReleaseResource();
 	IndexBuffer.Indices = NewIndices;
-	IndexBuffer.InitResource(FRHICommandListImmediate::Get());
+	// Never InitResource a zero-sized buffer — the RHI fatal-errors on it (a tear can remove the
+	// last triangle). Leave it released when empty; GetDynamicMeshElements already skips drawing
+	// at 0 indices, and a later cut/tear that re-adds faces re-inits it.
+	if (IndexBuffer.Indices.Num() > 0)
+	{
+		IndexBuffer.InitResource(FRHICommandListImmediate::Get());
+	}
 }
 
 void FSoftBodyMeshSceneProxy::GetDynamicMeshElements(

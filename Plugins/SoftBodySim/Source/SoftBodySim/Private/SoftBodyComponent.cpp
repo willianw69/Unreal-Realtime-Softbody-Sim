@@ -243,6 +243,16 @@ void USoftBodyComponent::BuildTetBoundarySurface()
 		return ((uint64)s0 * (uint64)K + (uint64)s1) * (uint64)K + (uint64)s2;
 	};
 
+	// A tet is REMOVED from the surface only if it's genuinely severed — its 4 particles span more
+	// than one connected chunk (a cut/tear crossed it). A tet whose volume constraint was merely
+	// DISABLED for stability (BreakVolumeShell drops a one-tet shell around every cut/tear so the
+	// PBD volume solve can't explode it) but whose 4 particles are still one chunk MUST stay, or the
+	// whole shell — and any small torn-off piece that's mostly shell — would vanish. At init (no
+	// breaks) everything is one component, so the full box surface is produced.
+	TArray<int32> Comp;
+	ComputeParticleComponents(Comp);
+	const bool bHaveComp = (Comp.Num() == NumParticles);
+
 	struct FFaceRec { uint32 A, B, C, Opp; int32 Count; };
 	TMap<uint64, FFaceRec> Faces;
 	Faces.Reserve(VolumeConstraintsCPU.Num() * 4);
@@ -262,11 +272,15 @@ void USoftBodyComponent::BuildTetBoundarySurface()
 
 	for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
 	{
-		if (VolumeBrokenCPU.IsValidIndex(t) && VolumeBrokenCPU[t] != 0)
-		{
-			continue; // removed tet
-		}
 		const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
+		if (bHaveComp)
+		{
+			const int32 C0 = Comp[V.I0];
+			if (Comp[V.I1] != C0 || Comp[V.I2] != C0 || Comp[V.I3] != C0)
+			{
+				continue; // tet torn across a cut/tear → removed from the surface
+			}
+		}
 		AddFace(V.I1, V.I2, V.I3, V.I0);
 		AddFace(V.I0, V.I2, V.I3, V.I1);
 		AddFace(V.I0, V.I1, V.I3, V.I2);
@@ -1476,6 +1490,12 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		UpdateCut();
 	}
 
+	// Stress tearing (SB-M12): sever over-stretched links so violent pulls/drags rip the body apart.
+	if (bTearable)
+	{
+		UpdateTear();
+	}
+
 	FSoftBodyParams Params;
 	Params.NumParticles     = NumParticles;
 	Params.ResX             = ResX;
@@ -1531,11 +1551,22 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		Params.Colliders.Add(G);
 	}
 
-	// Mouse grab (SB-M3) — world-space target pulled toward by the GPU grab pass.
-	Params.bGrabActive   = bIsGrabbing && GrabbedIndex != INDEX_NONE;
-	Params.GrabIndex     = GrabbedIndex;
-	Params.GrabTarget    = FVector3f(CurrentGrabTarget);
+	// Mouse grab (SB-M3 + cluster grab) — pull the whole grabbed region toward the cursor. Each
+	// particle's target is the cursor target plus its offset within the region (rigid translation).
+	Params.bGrabActive   = bIsGrabbing && GrabbedParticles.Num() > 0;
 	Params.GrabStiffness = GrabStiffness;
+	if (Params.bGrabActive)
+	{
+		const FVector3f Target(CurrentGrabTarget);
+		Params.GrabPoints.Reset(GrabbedParticles.Num());
+		for (int32 k = 0; k < GrabbedParticles.Num(); ++k)
+		{
+			FGPUGrab G;
+			G.Index  = (uint32)GrabbedParticles[k];
+			G.Target = Target + GrabOffsets[k];
+			Params.GrabPoints.Add(G);
+		}
+	}
 
 	// Fixed-timestep accumulator (frame-rate independent).
 	TimeAccumulator += DeltaTime;
@@ -1789,6 +1820,8 @@ void USoftBodyComponent::UpdateMouseGrab()
 	{
 		bIsGrabbing = false;
 		GrabbedIndex = INDEX_NONE;
+		GrabbedParticles.Reset();
+		GrabOffsets.Reset();
 	};
 
 	if (!bEnableMouseDrag || !RenderResources.IsValid())
@@ -1891,6 +1924,29 @@ void USoftBodyComponent::UpdateMouseGrab()
 			GrabbedIndex = BestIndex;
 			GrabDepth = BestDepth;
 			bIsGrabbing = true;
+
+			// Gather the dragged REGION: every cage particle within GrabRadiusScale of the pick,
+			// storing its world offset from the primary so the cluster translates rigidly with the
+			// cursor. Pulling a patch (not one vertex) makes the whole body easy to drag.
+			GrabbedParticles.Reset();
+			GrabOffsets.Reset();
+			const FVector Center(RenderResources->PositionCopy[GrabbedIndex]);
+			const float GrabR = EffectiveSpacing * GrabRadiusScale;
+			const float GrabRSq = GrabR * GrabR;
+			for (int32 p = 0; p < NumParticles; ++p)
+			{
+				const FVector Pp(RenderResources->PositionCopy[p]);
+				if (FVector::DistSquared(Pp, Center) <= GrabRSq)
+				{
+					GrabbedParticles.Add(p);
+					GrabOffsets.Add(FVector3f(Pp - Center));
+				}
+			}
+			if (GrabbedParticles.Num() == 0) // radius 0 / degenerate — at least grab the primary
+			{
+				GrabbedParticles.Add(GrabbedIndex);
+				GrabOffsets.Add(FVector3f::ZeroVector);
+			}
 		}
 		else
 		{
@@ -2003,47 +2059,16 @@ void USoftBodyComponent::UpdateCut()
 				bAnyCut = true;
 			}
 		}
-
-		// Mark every particle that has lost a distance constraint (across ALL cuts) — these sit on
-		// a cut surface. A tet touching one is under-constrained: it can invert once unsupported,
-		// and the PBD volume solve then OVER-corrects the inverted tet and launches its particles
-		// outward (the spikes that vanished at VolumeStiffness=0). So we drop the volume constraint
-		// of any tet touching a cut-surface particle: a one-tet shell around each cut gives up
-		// volume preservation (stays stable via its distance constraints) while the interior keeps
-		// its jelly. Built from the full broken set so it also covers straddling tets.
-		TArray<uint8> CutParticle;
-		CutParticle.Init(0, NumParticles);
-		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
-		{
-			if (DistanceBrokenCPU[i] != 0)
-			{
-				const FGPUConstraint& C = DistanceConstraintsCPU[i];
-				CutParticle[C.IndexA] = 1;
-				CutParticle[C.IndexB] = 1;
-			}
-		}
-
-		for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
-		{
-			if (VolumeBrokenCPU[t] != 0)
-			{
-				continue;
-			}
-			const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
-			if (CutParticle[V.I0] || CutParticle[V.I1] || CutParticle[V.I2] || CutParticle[V.I3])
-			{
-				// Straddling OR boundary tet (touches the cut surface) → remove volume to stop the
-				// inversion blow-up. (Straddling tets are a subset: all their particles are cut.)
-				VolumeBrokenCPU[t] = 1u;
-				bAnyCut = true;
-			}
-		}
 	}
 
 	if (!bAnyCut)
 	{
 		return;
 	}
+
+	// Drop the volume constraint of any tet touching the new cut surface so the PBD volume solve
+	// can't explode the under-constrained boundary tets (shared with tearing — see BreakVolumeShell).
+	BreakVolumeShell();
 
 	// Push the new broken flags to the GPU solver.
 	{
@@ -2077,28 +2102,10 @@ void USoftBodyComponent::UpdateCut()
 
 		// Connected components of cage particles over the SURVIVING distance constraints (= the
 		// physical chunks after ALL cuts so far). Each mesh vert is then re-bound to a tet inside
-		// its own chunk, so a tet torn across an earlier cut can never blend two chunks (which was
-		// the 2nd-cut spanning-sheet bug). Union-find with path halving; cuts are infrequent.
+		// its own chunk, so a tet torn across an earlier cut can never blend two chunks (the 2nd-cut
+		// spanning-sheet bug).
 		TArray<int32> ParticleComponent;
-		ParticleComponent.SetNumUninitialized(NumParticles);
-		for (int32 p = 0; p < NumParticles; ++p) { ParticleComponent[p] = p; }
-		auto Find = [&](int32 X) -> int32
-		{
-			while (ParticleComponent[X] != X)
-			{
-				ParticleComponent[X] = ParticleComponent[ParticleComponent[X]];
-				X = ParticleComponent[X];
-			}
-			return X;
-		};
-		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
-		{
-			if (DistanceBrokenCPU[i] != 0) { continue; }
-			const FGPUConstraint& C = DistanceConstraintsCPU[i];
-			const int32 RA = Find((int32)C.IndexA), RB = Find((int32)C.IndexB);
-			if (RA != RB) { ParticleComponent[RA] = RB; }
-		}
-		for (int32 p = 0; p < NumParticles; ++p) { ParticleComponent[p] = Find(p); }
+		ComputeParticleComponents(ParticleComponent);
 
 		const FTransform WorldToLocal = GetComponentTransform().Inverse();
 		const FVector3f LocalP(WorldToLocal.TransformPosition(PlanePoint));
@@ -2109,6 +2116,241 @@ void USoftBodyComponent::UpdateCut()
 			MarkRenderStateDirty(); // rebuild the proxy from the new Mesh* arrays via CreateSceneProxy
 		}
 	}
+}
+
+void USoftBodyComponent::ComputeParticleComponents(TArray<int32>& OutComponent) const
+{
+	// Union-find (path halving) over the SURVIVING distance constraints → one id per connected
+	// chunk. Shared by the cut (SB-M11) and tear (SB-M12) render paths to bind verts to their chunk.
+	OutComponent.SetNumUninitialized(NumParticles);
+	for (int32 p = 0; p < NumParticles; ++p) { OutComponent[p] = p; }
+	auto Find = [&](int32 X) -> int32
+	{
+		while (OutComponent[X] != X)
+		{
+			OutComponent[X] = OutComponent[OutComponent[X]];
+			X = OutComponent[X];
+		}
+		return X;
+	};
+	for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+	{
+		if (DistanceBrokenCPU[i] != 0) { continue; }
+		const FGPUConstraint& C = DistanceConstraintsCPU[i];
+		const int32 RA = Find((int32)C.IndexA), RB = Find((int32)C.IndexB);
+		if (RA != RB) { OutComponent[RA] = RB; }
+	}
+	for (int32 p = 0; p < NumParticles; ++p) { OutComponent[p] = Find(p); }
+}
+
+bool USoftBodyComponent::BreakVolumeShell()
+{
+	// A particle that has lost a distance constraint (across ALL cuts/tears) sits on a cut/tear
+	// surface. A tet touching one is under-constrained: it can invert once unsupported, and the PBD
+	// volume solve then OVER-corrects the inverted tet and launches its particles outward (the
+	// radial spikes that vanished at VolumeStiffness=0). So we drop the volume constraint of every
+	// tet touching such a particle — a one-tet shell around each cut/tear gives up volume
+	// preservation (still held by its distance constraints) while the interior keeps its jelly.
+	if (DistanceBrokenCPU.Num() != DistanceConstraintsCPU.Num() || NumParticles <= 0)
+	{
+		return false;
+	}
+	TArray<uint8> CutParticle;
+	CutParticle.Init(0, NumParticles);
+	for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+	{
+		if (DistanceBrokenCPU[i] != 0)
+		{
+			const FGPUConstraint& C = DistanceConstraintsCPU[i];
+			CutParticle[C.IndexA] = 1;
+			CutParticle[C.IndexB] = 1;
+		}
+	}
+
+	bool bAny = false;
+	for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
+	{
+		if (VolumeBrokenCPU[t] != 0) { continue; }
+		const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
+		if (CutParticle[V.I0] || CutParticle[V.I1] || CutParticle[V.I2] || CutParticle[V.I3])
+		{
+			VolumeBrokenCPU[t] = 1u;
+			bAny = true;
+		}
+	}
+	return bAny;
+}
+
+void USoftBodyComponent::UpdateTear()
+{
+	if (!RenderResources.IsValid() || DistanceConstraintsCPU.Num() == 0)
+	{
+		return;
+	}
+
+	// Throttle the O(constraints) strain scan to bound its CPU cost.
+	if ((TearFrameCounter++ % FMath::Max(1, TearCheckInterval)) != 0)
+	{
+		return;
+	}
+
+	const float Thresh = FMath::Max(1.1f, TearStrainThreshold);
+	const float ThreshSq = FMath::Square(Thresh);
+	// The dragged region resists tearing more (the grab pins it hard, so its boundary links are the
+	// most stretched and would rip off instantly otherwise). It's NOT immune: a violent enough pull
+	// still exceeds this relaxed threshold and tears the dragged patch away. 1.0 = no extra resistance.
+	const float GrabThreshSq = FMath::Square(Thresh * FMath::Max(1.0f, GrabTearResistance));
+
+	// Identify the grabbed region + its 1-ring (these use the relaxed threshold below).
+	TArray<uint8> Protected;
+	const bool bProtect = bIsGrabbing && GrabbedParticles.Num() > 0;
+	if (bProtect)
+	{
+		// Protect the whole grabbed region and its 1-ring (read grabbed flags from a separate array
+		// so neighbours don't cascade past one ring).
+		TArray<uint8> Grabbed; Grabbed.Init(0, NumParticles);
+		for (int32 g : GrabbedParticles) { if (g >= 0 && g < NumParticles) { Grabbed[g] = 1; } }
+		Protected = Grabbed;
+		for (const FGPUConstraint& C : DistanceConstraintsCPU)
+		{
+			if (Grabbed[C.IndexA]) { Protected[C.IndexB] = 1; }
+			if (Grabbed[C.IndexB]) { Protected[C.IndexA] = 1; }
+		}
+	}
+
+	// Sever every link stretched past RestLength * threshold, using the latest readback positions.
+	bool bAnyTear = false;
+	{
+		FScopeLock Lock(&RenderResources->PositionCopyCS);
+		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles)
+		{
+			return; // readback not ready
+		}
+		const TArray<FVector3f>& P = RenderResources->PositionCopy;
+
+		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+		{
+			if (DistanceBrokenCPU[i] != 0) { continue; }
+			const FGPUConstraint& C = DistanceConstraintsCPU[i];
+			if (C.RestLength <= KINDA_SMALL_NUMBER) { continue; }
+			// Links in the grabbed region use the relaxed (harder) threshold; the rest use the normal one.
+			const bool bInGrab = bProtect && (Protected[C.IndexA] || Protected[C.IndexB]);
+			const float UseThreshSq = bInGrab ? GrabThreshSq : ThreshSq;
+			const float LenSq = FVector3f::DistSquared(P[C.IndexA], P[C.IndexB]);
+			if (LenSq > UseThreshSq * C.RestLength * C.RestLength) // stretched past the tear threshold
+			{
+				DistanceBrokenCPU[i] = 1u;
+				bAnyTear = true;
+			}
+		}
+	}
+
+	if (!bAnyTear)
+	{
+		return;
+	}
+
+	// Same anti-blow-up guard as cutting, then push the new broken flags to the GPU solver.
+	BreakVolumeShell();
+	{
+		TSharedPtr<FSoftBodyRenderResources> Resources = RenderResources;
+		ENQUEUE_RENDER_COMMAND(SoftBodyApplyTear)(
+			[Resources, Dist = DistanceBrokenCPU, Vol = VolumeBrokenCPU]
+			(FRHICommandListImmediate& RHICmdList)
+			{
+				SoftBodyCompute::UpdateBrokenState_RenderThread(RHICmdList, Resources, Dist, Vol);
+			});
+	}
+
+	// Update the render surface for the new tear.
+	if (!bMeshMode)
+	{
+		// Box/lattice: re-extract the boundary from surviving tets so the tear opens up (SB-M10 path).
+		BuildTetBoundarySurface();
+		if (FSoftBodyMeshSceneProxy* Proxy = static_cast<FSoftBodyMeshSceneProxy*>(SceneProxy))
+		{
+			ENQUEUE_RENDER_COMMAND(SoftBodyTearReindex)(
+				[Proxy, NewTris = Triangles](FRHICommandListImmediate& RHICmdList)
+				{
+					Proxy->UpdateIndices_RenderThread(NewTris);
+				});
+		}
+	}
+	else if (MeshLocalPositions.Num() == NumMeshVerts && NumMeshVerts > 0)
+	{
+		// Embedded mesh: re-route verts to their chunk and rip the surface open along the tear.
+		TArray<int32> ParticleComponent;
+		ComputeParticleComponents(ParticleComponent);
+		TearMeshToComponents(ParticleComponent);
+		MarkRenderStateDirty();
+	}
+}
+
+void USoftBodyComponent::TearMeshToComponents(const TArray<int32>& ParticleComponent)
+{
+	// Rip the embedded surface open along an arbitrary tear (no plane, no caps): bind each vert to a
+	// tet in its own chunk, and drop any triangle whose 3 verts ended up in different chunks so the
+	// mesh visibly separates. Reuses the SB-M11 component embedding (convex, in-chunk, point-bind
+	// fallback) so torn pieces follow their chunk without spikes.
+	if (ParticleComponent.Num() != NumParticles || NumMeshVerts == 0 || MeshTriangles.Num() < 3)
+	{
+		return;
+	}
+
+	// Chunk per vert = the component carrying the most total barycentric weight in its tet (so a
+	// vert near a tear follows the side it mostly belongs to). Plane-free variant of SB-M11 routing.
+	auto VertChunk = [&](int32 v) -> int32
+	{
+		if (!Tets.IsValidIndex(EmbedTet[v])) { return INDEX_NONE; }
+		const FSoftBodyTet& T = Tets[EmbedTet[v]];
+		const FVector4f& W = EmbedWeights[v];
+		const int32 Idx[4] = { (int32)T.V0, (int32)T.V1, (int32)T.V2, (int32)T.V3 };
+		const float Wt[4]  = { W.X, W.Y, W.Z, W.W };
+		int32 BestComp = ParticleComponent[Idx[0]]; float BestSum = -1.0f;
+		for (int32 k = 0; k < 4; ++k)
+		{
+			const int32 Comp = ParticleComponent[Idx[k]];
+			float Sum = 0.0f;
+			for (int32 j = 0; j < 4; ++j) { if (ParticleComponent[Idx[j]] == Comp) { Sum += Wt[j]; } }
+			if (Sum > BestSum) { BestSum = Sum; BestComp = Comp; }
+		}
+		return BestComp;
+	};
+
+	TArray<int32> VertComponent;
+	VertComponent.SetNumUninitialized(NumMeshVerts);
+	for (int32 v = 0; v < NumMeshVerts; ++v) { VertComponent[v] = VertChunk(v); }
+
+	auto TetMultiComp = [&](int32 GeomTet) -> bool
+	{
+		if (!Tets.IsValidIndex(GeomTet)) { return false; }
+		const FSoftBodyTet& T = Tets[GeomTet];
+		const int32 C = ParticleComponent[T.V0];
+		return ParticleComponent[T.V1] != C || ParticleComponent[T.V2] != C || ParticleComponent[T.V3] != C;
+	};
+
+	// Rebind verts whose tet straddles a tear to an intact tet in their own chunk.
+	for (int32 v = 0; v < NumMeshVerts; ++v)
+	{
+		if (VertComponent[v] != INDEX_NONE && TetMultiComp(EmbedTet[v]))
+		{
+			EmbedPointRest(MeshRestPositions[v], EmbedTet[v], EmbedWeights[v], &ParticleComponent, VertComponent[v]);
+		}
+	}
+
+	// Keep only triangles whose 3 verts are in the same chunk; drop the rest → the surface rips open.
+	TArray<uint32> NewTris;
+	NewTris.Reserve(MeshTriangles.Num());
+	for (int32 tri = 0; tri + 2 < MeshTriangles.Num(); tri += 3)
+	{
+		const int32 A = (int32)MeshTriangles[tri], B = (int32)MeshTriangles[tri + 1], Cc = (int32)MeshTriangles[tri + 2];
+		const int32 Ca = VertComponent[A], Cb = VertComponent[B], Cd = VertComponent[Cc];
+		if (Ca != INDEX_NONE && Ca == Cb && Cb == Cd)
+		{
+			NewTris.Add(A); NewTris.Add(B); NewTris.Add(Cc);
+		}
+	}
+	MeshTriangles = MoveTemp(NewTris);
 }
 
 void USoftBodyComponent::DrawDebug()

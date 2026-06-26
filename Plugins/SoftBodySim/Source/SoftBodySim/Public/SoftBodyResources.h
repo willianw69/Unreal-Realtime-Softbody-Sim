@@ -56,6 +56,19 @@ struct FGPUVolumeConstraint
 	float  StiffScale = 1.0f;
 };
 
+/**
+ * One grabbed particle and its world-space target, as the GPU grab pass sees it (SB-M3 / cluster
+ * grab). The mouse drag grabs a whole REGION of particles (a radius around the pick) and pulls each
+ * toward the cursor target offset by its position within the region, so dragging moves a patch of
+ * the body rather than a single vertex. Must match the HLSL `FGrab` struct in SBGrab.usf (16 bytes:
+ * uint + float3, tight layout — structured buffers pack tightly).
+ */
+struct FGPUGrab
+{
+	uint32    Index = 0;
+	FVector3f Target = FVector3f::ZeroVector;
+};
+
 /** Contiguous [Start, Count) span of one color within a sorted constraint buffer. */
 struct FSoftBodyColorRange
 {
@@ -103,11 +116,11 @@ struct FSoftBodyParams
 	float   XpbdGlobalCompliance = 0.0f;   // baseline compliance everywhere (0 = rigid; higher = softer)
 	float   XpbdSoftCompliance = 0.001f;   // extra compliance added at full paint weight (white)
 
-	// Mouse drag (SB-M3) — pull one grabbed particle toward a world-space cursor target.
-	bool      bGrabActive = false;
-	int32     GrabIndex = -1;
-	FVector3f GrabTarget = FVector3f::ZeroVector;
-	float     GrabStiffness = 0.8f; // [0,1] firmness of the attachment
+	// Mouse drag (SB-M3 + cluster grab) — pull a region of grabbed particles toward their
+	// world-space targets. GrabPoints is rebuilt each frame from the dragged cluster.
+	bool                 bGrabActive = false;
+	TArray<FGPUGrab>     GrabPoints;
+	float                GrabStiffness = 0.8f; // [0,1] firmness of the attachment
 
 	// Collision — world-space sphere/capsule colliders rebuilt each frame (SB-M4).
 	TArray<FGPUCollider> Colliders;

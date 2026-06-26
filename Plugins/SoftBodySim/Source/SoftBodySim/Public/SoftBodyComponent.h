@@ -308,6 +308,37 @@ public:
 	bool bCuttable = false;
 
 	/**
+	 * Make the body TEAR under stress (SB-M12): when a structural link is stretched past
+	 * TearStrainThreshold it snaps, so pulling the body apart with opposing forces — or dragging it
+	 * violently faster than the solver can keep up — rips it into chunks. Works on box/lattice
+	 * (clean re-extracted surface) and embedded meshes (pieces follow their chunk; the surface rips
+	 * open, uncapped). Off by default (the strain scan has a per-frame CPU cost while enabled).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Cutting")
+	bool bTearable = false;
+
+	/**
+	 * Tear sensitivity: a link snaps once its current length exceeds RestLength × this. 1.0 = tears
+	 * at any stretch (very fragile); higher = must be pulled further before it rips. Lower this if
+	 * the body refuses to tear, raise it if it tears during normal jiggle/squash.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Cutting", meta = (ClampMin = "1.1", ClampMax = "5.0", EditCondition = "bTearable"))
+	float TearStrainThreshold = 1.8f;
+
+	/** Run the (O(constraints)) tear strain scan every N frames to bound its CPU cost. 1 = every frame. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Cutting", meta = (ClampMin = "1", ClampMax = "10", EditCondition = "bTearable"))
+	int32 TearCheckInterval = 2;
+
+	/**
+	 * How much harder the region you're DRAGGING resists tearing, as a multiple of TearStrainThreshold.
+	 * The grab pins particles hard, so without this the handle would rip off instantly even on a gentle
+	 * drag. Higher = the dragged patch holds through stronger pulls; 1.0 = the dragged area tears as
+	 * easily as the rest (yank it and it rips away). Only the grabbed region + its immediate ring use this.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Cutting", meta = (ClampMin = "1.0", ClampMax = "6.0", EditCondition = "bTearable"))
+	float GrabTearResistance = 2.0f;
+
+	/**
 	 * Left-click and drag to grab the nearest surface point and pull the body around
 	 * (SB-M3). Enables the mouse cursor at BeginPlay. Picking + dragging are CPU-side
 	 * (from the position readback); a GPU pass pulls the grabbed particle to the cursor.
@@ -322,6 +353,12 @@ public:
 	/** How close (in multiples of Spacing) the click ray must pass to a surface particle to grab it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.25"))
 	float GrabPickRadiusScale = 1.5f;
+
+	/** Size of the dragged REGION: every particle within this many multiples of the cage spacing of
+	 *  the pick is grabbed and pulled along, so dragging moves a patch of the body rather than a
+	 *  single vertex. Larger = a bigger, stiffer handle; 0 ≈ single-particle grab. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.0", ClampMax = "20.0"))
+	float GrabRadiusScale = 2.5f;
 
 	/** Material applied to the soft body. Use a TWO-SIDED material to light both faces. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Render")
@@ -370,6 +407,24 @@ private:
 	/** Poll RIGHT-mouse: drag a stroke to define a cut plane, then sever every constraint
 	 *  crossing it and re-extract the surface (SB-M10). */
 	void UpdateCut();
+
+	/** Per-frame (throttled): sever distance constraints stretched past TearStrainThreshold so the
+	 *  body tears under opposing forces / violent drag, then update the render like a cut (SB-M12). */
+	void UpdateTear();
+
+	/** Connected-component (chunk) id per cage particle over the SURVIVING distance constraints
+	 *  (union-find). Shared by the cut + tear render paths to bind verts to their own chunk. */
+	void ComputeParticleComponents(TArray<int32>& OutComponent) const;
+
+	/** Break the volume constraint of any tet touching a particle that has lost a distance
+	 *  constraint (a cut/tear surface), so the PBD volume solve can't explode under-constrained
+	 *  boundary tets. Returns true if it broke any. Operates on the CPU broken-flag mirrors. */
+	bool BreakVolumeShell();
+
+	/** Re-route the embedded mesh to the current chunks after a tear (no plane): rebind verts whose
+	 *  tet spans chunks to a tet in their own chunk, and drop triangles spanning chunks so the
+	 *  surface rips open (uncapped). Reuses the SB-M11 component embedding (SB-M12). */
+	void TearMeshToComponents(const TArray<int32>& ParticleComponent);
 
 	/** Derive deduped distance constraints from the tet edges and greedily graph-color
 	 *  them, producing a color-sorted buffer + per-color ranges. */
@@ -479,10 +534,14 @@ private:
 	TArray<int32> BoundaryParticles;
 
 	// Mouse grab state (SB-M3). GrabbedIndex == INDEX_NONE when not grabbing.
-	int32   GrabbedIndex = INDEX_NONE;
+	int32   GrabbedIndex = INDEX_NONE;   // primary picked particle (drag handle center)
 	float   GrabDepth = 0.0f;            // distance along the click ray to the grabbed point
 	bool    bIsGrabbing = false;
-	FVector CurrentGrabTarget = FVector::ZeroVector; // world space
+	FVector CurrentGrabTarget = FVector::ZeroVector; // world space (target for the primary particle)
+	// Cluster grab: every particle within GrabRadiusScale of the pick, with its world-space offset
+	// from the primary at grab time, so the whole region translates rigidly with the cursor.
+	TArray<int32>     GrabbedParticles;
+	TArray<FVector3f> GrabOffsets;
 
 	// Scratch reused each frame for the proxy update (local space).
 	TArray<FVector3f> LocalPositions;
@@ -509,6 +568,10 @@ private:
 	// True while we're suppressing the controller's look input so a cut swipe doesn't also rotate
 	// the camera (balanced SetIgnoreLookInput calls; restored on release / EndPlay).
 	bool    bCutLookSuppressed = false;
+
+	// --- Tearing (SB-M12) -------------------------------------------------
+	// Frame counter so the strain scan can be throttled to every TearCheckInterval frames.
+	int32   TearFrameCounter = 0;
 
 	FBoxSphereBounds LocalBounds = FBoxSphereBounds(ForceInit);
 
