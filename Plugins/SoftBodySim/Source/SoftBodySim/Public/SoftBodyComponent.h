@@ -350,6 +350,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float GrabStiffness = 0.8f;
 
+	/** Hold SHIFT to freeze the camera while moving the mouse, so you can drag, cut, or pull without
+	 *  the view rotating with the motion. A global modifier — works for every interaction. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction")
+	bool bHoldShiftToFreezeCamera = true;
+
 	/** How close (in multiples of Spacing) the click ray must pass to a surface particle to grab it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.25"))
 	float GrabPickRadiusScale = 1.5f;
@@ -484,6 +489,10 @@ private:
 	 *  cursor target at that depth. Updates the grab state read by TickComponent (SB-M3). */
 	void UpdateMouseGrab();
 
+	/** Hold-Shift camera freeze: suppress the controller's look input while Shift is held so dragging /
+	 *  cutting / pulling by moving the mouse doesn't rotate the view. Global, not tied to any one action. */
+	void UpdateCameraFreeze();
+
 	/** Draw readback positions as debug points (optional). */
 	void DrawDebug();
 
@@ -565,9 +574,9 @@ private:
 	bool    bCutStrokeActive = false;
 	FVector CutStrokeStartOrigin = FVector::ZeroVector;
 	FVector CutStrokeStartDir = FVector::ZeroVector;
-	// True while we're suppressing the controller's look input so a cut swipe doesn't also rotate
-	// the camera (balanced SetIgnoreLookInput calls; restored on release / EndPlay).
-	bool    bCutLookSuppressed = false;
+	// True while we're freezing the controller's look input (hold-Shift camera freeze) so dragging /
+	// cutting doesn't rotate the view (balanced SetIgnoreLookInput calls; restored on release / EndPlay).
+	bool    bLookSuppressed = false;
 
 	// --- Tearing (SB-M12) -------------------------------------------------
 	// Frame counter so the strain scan can be throttled to every TearCheckInterval frames.

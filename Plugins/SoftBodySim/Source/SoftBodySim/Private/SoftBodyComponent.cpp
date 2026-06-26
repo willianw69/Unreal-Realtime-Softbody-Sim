@@ -1481,6 +1481,9 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		return;
 	}
 
+	// Hold Shift to freeze the camera while dragging / cutting (global modifier).
+	UpdateCameraFreeze();
+
 	// Mouse pick/drag — updates GrabbedIndex / CurrentGrabTarget for the params below.
 	UpdateMouseGrab();
 
@@ -1961,6 +1964,35 @@ void USoftBodyComponent::UpdateMouseGrab()
 	}
 }
 
+void USoftBodyComponent::UpdateCameraFreeze()
+{
+	// Hold SHIFT to freeze the camera, so you can DRAG or CUT (or pull) by moving the mouse without
+	// the view rotating with it. This is a global modifier — independent of cut/drag — so it works
+	// for every interaction. Balanced SetIgnoreLookInput (toggled only on change) keeps the engine's
+	// ignore counter returning to 0; also reset in EndPlay in case we're destroyed while frozen.
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!PC)
+	{
+		bLookSuppressed = false; // controller gone — nothing to restore
+		return;
+	}
+
+	const bool bWantFreeze = bHoldShiftToFreezeCamera
+		&& (PC->IsInputKeyDown(EKeys::LeftShift) || PC->IsInputKeyDown(EKeys::RightShift));
+
+	if (bWantFreeze && !bLookSuppressed)
+	{
+		PC->SetIgnoreLookInput(true);
+		bLookSuppressed = true;
+	}
+	else if (!bWantFreeze && bLookSuppressed)
+	{
+		PC->SetIgnoreLookInput(false);
+		bLookSuppressed = false;
+	}
+}
+
 void USoftBodyComponent::UpdateCut()
 {
 	UWorld* World = GetWorld();
@@ -1975,20 +2007,8 @@ void USoftBodyComponent::UpdateCut()
 	FVector RayO, RayD;
 	const bool bRay = PC->DeprojectMousePositionToWorld(RayO, RayD);
 
-	// Freeze the camera while the right button is held so a cut swipe slices instead of also
-	// rotating the view (you can hold RMB and drag across the body to define the cut plane). Look
-	// input is restored the moment the button is released. Balanced so the ignore counter returns
-	// to 0; also reset in EndPlay in case we're destroyed mid-stroke.
-	if (bDown && !bCutLookSuppressed)
-	{
-		PC->SetIgnoreLookInput(true);
-		bCutLookSuppressed = true;
-	}
-	else if (!bDown && bCutLookSuppressed)
-	{
-		PC->SetIgnoreLookInput(false);
-		bCutLookSuppressed = false;
-	}
+	// (Camera freeze is handled globally by UpdateCameraFreeze on the Shift key, so you can hold
+	// Shift and drag OR cut without the view moving — see TickComponent.)
 
 	// Press: record the stroke start ray.
 	if (bDown && !bCutStrokeActive)
@@ -2385,8 +2405,8 @@ void USoftBodyComponent::DrawDebug()
 
 void USoftBodyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// Restore camera look input if we were suppressing it for a cut stroke (SB-M11).
-	if (bCutLookSuppressed)
+	// Restore camera look input if we were freezing it (hold-Shift camera freeze).
+	if (bLookSuppressed)
 	{
 		if (UWorld* World = GetWorld())
 		{
@@ -2395,7 +2415,7 @@ void USoftBodyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 				PC->SetIgnoreLookInput(false);
 			}
 		}
-		bCutLookSuppressed = false;
+		bLookSuppressed = false;
 	}
 
 	// Stop participating in inter-body collision before our resources are released (SB-M9).
