@@ -614,83 +614,554 @@ bool USoftBodyComponent::ReadSourceMesh()
 	return true;
 }
 
+void USoftBodyComponent::EmbedPointRest(const FVector3f& P, int32& OutTet, FVector4f& OutWeights,
+	const TArray<int32>* ParticleComponent, int32 RequiredComponent) const
+{
+	const bool bFilter = (ParticleComponent != nullptr) && (RequiredComponent != INDEX_NONE)
+		&& (ParticleComponent->Num() == NumParticles);
+	const TArray<int32>* PC = bFilter ? ParticleComponent : nullptr;
+
+	const int32 CellsX = ResX - 1;
+	const int32 CellsY = ResY - 1;
+
+	// Base cage cell for this point (clamped). Search a block around it: a single cell for the
+	// plain embed, but WIDER when re-binding across a cut, because the only tets in this vert's own
+	// CHUNK may be a couple of cells away (its near neighbours got severed by the cut).
+	const int32 Bx = FMath::Clamp((int32)FMath::FloorToInt((P.X - CageMin.X) / CageCellSize.X), 0, CellsX - 1);
+	const int32 By = FMath::Clamp((int32)FMath::FloorToInt((P.Y - CageMin.Y) / CageCellSize.Y), 0, CellsY - 1);
+	const int32 Bz = FMath::Clamp((int32)FMath::FloorToInt((P.Z - CageMin.Z) / CageCellSize.Z), 0, ResZ - 2);
+
+	int32   BestTet = 0;
+	FVector4f BestW(0.25f, 0.25f, 0.25f, 0.25f);
+	float   BestMin = -FLT_MAX; // maximise the minimum weight → best containment
+
+	// Filtered (post-cut, SB-M11): best tet whose 4 particles are ALL in RequiredComponent (one
+	// physical chunk). A tet spanning components is torn across a cut and would blend far-apart
+	// particles into a spanning sheet — so it's never a candidate.
+	int32   BestCompTet = INDEX_NONE;
+	FVector4f BestCompW(0.25f, 0.25f, 0.25f, 0.25f);
+	float   BestCompMin = -FLT_MAX;
+
+	// Fallback target: the single highest-weight cage PARTICLE that is in RequiredComponent. Used
+	// only if NO fully-in-component tet is reachable (thin sliver / fragmented region) — we then
+	// rigidly bind to this one particle (weight 1) so the vert still follows its own chunk and can
+	// never blend across a tear (which is what was still spiking the caps).
+	int32   BestPartTet = INDEX_NONE;
+	int32   BestPartSlot = 0;
+	float   BestPartW = -FLT_MAX;
+
+	const int32 R = bFilter ? 3 : 1; // widen the search when re-binding across a cut
+
+	for (int32 dz = -R; dz <= R; ++dz)
+	for (int32 dy = -R; dy <= R; ++dy)
+	for (int32 dx = -R; dx <= R; ++dx)
+	{
+		const int32 Cx = Bx + dx;
+		const int32 Cy = By + dy;
+		const int32 Cz = Bz + dz;
+		if (Cx < 0 || Cy < 0 || Cz < 0 || Cx >= CellsX || Cy >= CellsY || Cz >= ResZ - 1)
+		{
+			continue;
+		}
+
+		// Cell → tet base (matches BuildTets iteration order: Z outer, Y, X inner, 6/cell).
+		const int32 CellLinear = (Cz * CellsY + Cy) * CellsX + Cx;
+		const int32 TetBase = CellLinear * 6;
+
+		for (int32 t = 0; t < 6; ++t)
+		{
+			const FSoftBodyTet& T = Tets[TetBase + t];
+			const FVector4f W = TetBarycentric(
+				InitialLocalPositions[T.V0], InitialLocalPositions[T.V1],
+				InitialLocalPositions[T.V2], InitialLocalPositions[T.V3], P);
+
+			const float MinW = FMath::Min(FMath::Min(W.X, W.Y), FMath::Min(W.Z, W.W));
+			if (MinW > BestMin)
+			{
+				BestMin = MinW;
+				BestTet = TetBase + t;
+				BestW = W;
+			}
+
+			// In-component candidate: all 4 cage particles in the vert's own chunk (intact tet).
+			// Also track the best single in-component particle for the point-bind fallback.
+			if (bFilter)
+			{
+				const int32 Idx4[4] = { T.V0, T.V1, T.V2, T.V3 };
+				const float W4[4]   = { W.X, W.Y, W.Z, W.W };
+				bool bInComp = true;
+				for (int32 k = 0; k < 4; ++k)
+				{
+					if ((*PC)[Idx4[k]] == RequiredComponent)
+					{
+						if (W4[k] > BestPartW) { BestPartW = W4[k]; BestPartTet = TetBase + t; BestPartSlot = k; }
+					}
+					else
+					{
+						bInComp = false;
+					}
+				}
+				if (bInComp && MinW > BestCompMin)
+				{
+					BestCompMin = MinW; BestCompTet = TetBase + t; BestCompW = W;
+				}
+			}
+
+			// Early-out only when NOT filtering: a fully-contained tet is optimal for the plain
+			// embed, but the filtered path must keep scanning for an in-component tet.
+			if (!bFilter && MinW >= 0.0f)
+			{
+				dx = dy = dz = R + 1; // break all three loops
+				break;
+			}
+		}
+	}
+
+	// Filtered (post-cut): bind to the best-containing INTACT tet in this vert's own chunk, using
+	// CONVEX (clamped, non-negative) weights. A cut vert sits ON the cut plane, just OUTSIDE its
+	// chunk's tets, so raw barycentric weights are non-convex (some negative) and would EXTRAPOLATE
+	// — amplifying the loosened cut-boundary tets' motion into long spikes. Convex weights bound the
+	// vert to its 4 cage particles' hull (no blow-up); the best-containing tet keeps the inset well
+	// under a cell. Binding strictly within the chunk is what stops the 2nd-cut spanning sheets.
+	if (bFilter && BestCompTet != INDEX_NONE)
+	{
+		FVector4f W = BestCompW;
+		W.X = FMath::Max(W.X, 0.0f);
+		W.Y = FMath::Max(W.Y, 0.0f);
+		W.Z = FMath::Max(W.Z, 0.0f);
+		W.W = FMath::Max(W.W, 0.0f);
+		const float Sum = W.X + W.Y + W.Z + W.W;
+		OutTet = BestCompTet;
+		OutWeights = (Sum > KINDA_SMALL_NUMBER) ? (W * (1.0f / Sum)) : FVector4f(0.25f, 0.25f, 0.25f, 0.25f);
+		return;
+	}
+
+	// No fully-in-component tet nearby: rigidly bind to the best in-component PARTICLE (weight 1).
+	// This keeps the vert glued to its own chunk and stable (it just follows one real particle) —
+	// crucially it NEVER blends across a tear, so it can't spike like the unfiltered torn-tet path.
+	if (bFilter && BestPartTet != INDEX_NONE)
+	{
+		OutTet = BestPartTet;
+		FVector4f W(0.0f, 0.0f, 0.0f, 0.0f);
+		switch (BestPartSlot) { case 0: W.X = 1.0f; break; case 1: W.Y = 1.0f; break; case 2: W.Z = 1.0f; break; default: W.W = 1.0f; break; }
+		OutWeights = W;
+		return;
+	}
+
+	// Unfiltered (or no same-side tet nearby): use the best-containing tet, clamping weights to
+	// its convex hull if the point sits slightly outside so it stays glued instead of flying off.
+	if (BestMin < 0.0f)
+	{
+		FVector4f W = BestW;
+		W.X = FMath::Max(W.X, 0.0f);
+		W.Y = FMath::Max(W.Y, 0.0f);
+		W.Z = FMath::Max(W.Z, 0.0f);
+		W.W = FMath::Max(W.W, 0.0f);
+		const float Sum = W.X + W.Y + W.Z + W.W;
+		BestW = (Sum > KINDA_SMALL_NUMBER) ? (W * (1.0f / Sum)) : FVector4f(0.25f, 0.25f, 0.25f, 0.25f);
+	}
+
+	OutTet = BestTet;
+	OutWeights = BestW;
+}
+
 void USoftBodyComponent::BuildEmbedding()
 {
 	EmbedTet.SetNumUninitialized(NumMeshVerts);
 	EmbedWeights.SetNumUninitialized(NumMeshVerts);
 
-	const int32 CellsX = ResX - 1;
-	const int32 CellsY = ResY - 1;
-
 	for (int32 v = 0; v < NumMeshVerts; ++v)
 	{
-		const FVector3f P = MeshRestPositions[v];
+		EmbedPointRest(MeshRestPositions[v], EmbedTet[v], EmbedWeights[v]);
+	}
+}
 
-		// Base cage cell for this vertex (clamped); search a 3x3x3 block around it so a
-		// vertex near a cell boundary or just outside (padding/concavity) still binds.
-		const int32 Bx = FMath::Clamp((int32)FMath::FloorToInt((P.X - CageMin.X) / CageCellSize.X), 0, CellsX - 1);
-		const int32 By = FMath::Clamp((int32)FMath::FloorToInt((P.Y - CageMin.Y) / CageCellSize.Y), 0, CellsY - 1);
-		const int32 Bz = FMath::Clamp((int32)FMath::FloorToInt((P.Z - CageMin.Z) / CageCellSize.Z), 0, ResZ - 2);
+void USoftBodyComponent::ClipMeshAlongPlane(const FVector3f& LocalP, const FVector3f& LocalN, const TArray<int32>& ParticleComponent)
+{
+	if (MeshLocalPositions.Num() != NumMeshVerts || NumMeshVerts == 0 || MeshTriangles.Num() < 3)
+	{
+		return;
+	}
+	const bool bHaveComp = (ParticleComponent.Num() == NumParticles);
 
-		int32   BestTet = 0;
-		FVector4f BestW(0.25f, 0.25f, 0.25f, 0.25f);
-		float   BestMin = -FLT_MAX; // maximise the minimum weight → best containment
+	const int32 OrigVerts = NumMeshVerts;
 
-		for (int32 dz = -1; dz <= 1; ++dz)
-		for (int32 dy = -1; dy <= 1; ++dy)
-		for (int32 dx = -1; dx <= 1; ++dx)
+	// Does a cage tet (geometric Tets[] index) span more than one chunk (torn across a cut)?
+	auto TetMultiComp = [&](int32 GeomTet) -> bool
+	{
+		if (!Tets.IsValidIndex(GeomTet) || !bHaveComp)
 		{
-			const int32 Cx = Bx + dx;
-			const int32 Cy = By + dy;
-			const int32 Cz = Bz + dz;
-			if (Cx < 0 || Cy < 0 || Cz < 0 || Cx >= CellsX || Cy >= CellsY || Cz >= ResZ - 1)
+			return false;
+		}
+		const FSoftBodyTet& T = Tets[GeomTet];
+		const int32 C = ParticleComponent[T.V0];
+		return ParticleComponent[T.V1] != C || ParticleComponent[T.V2] != C || ParticleComponent[T.V3] != C;
+	};
+
+	// Per-particle side of THIS cut plane, in deformed local space (the SAME plane the mesh verts
+	// are classified against just below — so vert side and particle side are consistent).
+	TArray<int32> PartSide;
+	const bool bHaveSide = bHaveComp && (LocalPositions.Num() == NumParticles);
+	if (bHaveSide)
+	{
+		PartSide.SetNumUninitialized(NumParticles);
+		for (int32 p = 0; p < NumParticles; ++p)
+		{
+			PartSide[p] = (FVector3f::DotProduct(LocalPositions[p] - LocalP, LocalN) >= 0.0f) ? +1 : -1;
+		}
+	}
+
+	// Side of each vertex in DEFORMED space (where the user sees the body). >= 0 = "+". Drives the
+	// triangle split AND which side's cage particle each vert routes to.
+	TArray<float> Side;
+	Side.SetNumUninitialized(OrigVerts);
+	for (int32 i = 0; i < OrigVerts; ++i)
+	{
+		Side[i] = FVector3f::DotProduct(MeshLocalPositions[i] - LocalP, LocalN);
+	}
+	auto IsPlus = [&](int32 i) { return Side[i] >= 0.0f; };
+
+	// The chunk (connected component) each ORIGINAL vert belongs to: among its embedding tet's 4
+	// cage particles, take the highest-weight one ON THE VERT'S OWN SIDE of the cut — its component
+	// is the vert's post-cut piece. Routing by SIDE (not just dominant weight) is essential: a vert
+	// right at the cut often has its single largest weight on a particle just ACROSS the plane,
+	// which would bind it to the wrong chunk and fling it across the gap (the spanning sheets).
+	// Components on top of side then disambiguate chunks created by EARLIER cuts. Falls back to the
+	// overall max-weight particle if none of the 4 is on the vert's side (rare).
+	auto VertChunk = [&](int32 v) -> int32
+	{
+		if (!bHaveComp || !Tets.IsValidIndex(EmbedTet[v]))
+		{
+			return INDEX_NONE;
+		}
+		const FSoftBodyTet& T = Tets[EmbedTet[v]];
+		const FVector4f& W = EmbedWeights[v];
+		const int32 Idx[4] = { T.V0, T.V1, T.V2, T.V3 };
+		const float Wt[4]  = { W.X, W.Y, W.Z, W.W };
+		const int32 VS = IsPlus(v) ? +1 : -1;
+		// Among the embedding tet's particles on the vert's side, pick the COMPONENT carrying the
+		// most total weight (not just the single max-weight particle). Summing per component avoids
+		// routing the vert to a tiny/singleton fragment (a particle isolated by cuts) when a real
+		// chunk is also present — a singleton target has no intact tet and forced the torn-tet spike.
+		int32 BestComp = INDEX_NONE; float BestCompWSum = -1.0f;
+		int32 BestAny = T.V0;        float BestAnyW = W.X;
+		for (int32 k = 0; k < 4; ++k)
+		{
+			if (Wt[k] > BestAnyW) { BestAnyW = Wt[k]; BestAny = Idx[k]; }
+			if (bHaveSide && PartSide[Idx[k]] != VS) { continue; } // consider only the vert's side
+			const int32 Comp = ParticleComponent[Idx[k]];
+			float Sum = 0.0f;
+			for (int32 j = 0; j < 4; ++j)
+			{
+				if (bHaveSide && PartSide[Idx[j]] != VS) { continue; }
+				if (ParticleComponent[Idx[j]] == Comp) { Sum += Wt[j]; }
+			}
+			if (Sum > BestCompWSum) { BestCompWSum = Sum; BestComp = Comp; }
+		}
+		return (BestComp != INDEX_NONE) ? BestComp : ParticleComponent[BestAny];
+	};
+	TArray<int32> VertComponent;
+	VertComponent.SetNumUninitialized(OrigVerts);
+	for (int32 v = 0; v < OrigVerts; ++v)
+	{
+		VertComponent[v] = VertChunk(v);
+	}
+
+	// New geometry starts as a copy of the originals (kept; unused verts are harmless). New
+	// seam/cap verts are appended. Rest position drives the embedding; new verts get rest
+	// positions on the rest edge at the same parameter as the deformed crossing.
+	TArray<FVector3f> NewRest = MeshRestPositions;
+	TArray<FVector2f> NewUV   = MeshUV0;
+	TArray<int32>     NewTet  = EmbedTet;
+	TArray<FVector4f> NewW    = EmbedWeights;
+	TArray<uint32>    NewTris;
+	NewTris.Reserve(MeshTriangles.Num() * 2 + 64);
+
+	// New verts embed into an intact tet within the TARGET CHUNK so they follow their half cleanly.
+	auto AppendVert = [&](const FVector3f& R, const FVector2f& U, int32 CompTarget) -> int32
+	{
+		int32 Tet; FVector4f W;
+		EmbedPointRest(R, Tet, W, bHaveComp ? &ParticleComponent : nullptr, CompTarget);
+		const int32 Idx = NewRest.Add(R);
+		NewUV.Add(U); NewTet.Add(Tet); NewW.Add(W);
+		return Idx;
+	};
+
+	// Per mesh-edge intersection verts, deduped, with a separate copy per side so the two halves
+	// can pull apart. Each copy is bound to ITS OWN endpoint's chunk (the + copy follows the +
+	// endpoint's chunk, the − copy the − endpoint's), so the seam separates along the cut.
+	const int64 K = OrigVerts;
+	TMap<uint64, FIntPoint> EdgeInter; // key -> (PlusIdx, MinusIdx)
+	auto GetInter = [&](int32 A, int32 B, int32& OutPlus, int32& OutMinus)
+	{
+		const int32 Lo = FMath::Min(A, B);
+		const int32 Hi = FMath::Max(A, B);
+		const uint64 Key = (uint64)Lo * (uint64)K + (uint64)Hi;
+		if (FIntPoint* Found = EdgeInter.Find(Key))
+		{
+			OutPlus = Found->X; OutMinus = Found->Y; return;
+		}
+		const float SLo = Side[Lo], SHi = Side[Hi];
+		float T = (FMath::Abs(SLo - SHi) > 1e-6f) ? (SLo / (SLo - SHi)) : 0.5f;
+		T = FMath::Clamp(T, 0.0f, 1.0f);
+		const FVector3f Rest = FMath::Lerp(MeshRestPositions[Lo], MeshRestPositions[Hi], T);
+		const FVector2f UV   = FMath::Lerp(MeshUV0[Lo], MeshUV0[Hi], T);
+		const int32 PlusEnd  = IsPlus(A) ? A : B; // geometric + endpoint
+		const int32 MinusEnd = IsPlus(A) ? B : A;
+		const int32 Pi = AppendVert(Rest, UV, VertComponent[PlusEnd]);  // + side copy → + endpoint's chunk
+		const int32 Mi = AppendVert(Rest, UV, VertComponent[MinusEnd]); // − side copy → − endpoint's chunk
+		EdgeInter.Add(Key, FIntPoint(Pi, Mi));
+		OutPlus = Pi; OutMinus = Mi;
+	};
+
+	// Cut segments per side (one per straddling triangle) → assembled into cap loops below.
+	TArray<TPair<int32, int32>> PlusSegs, MinusSegs;
+
+	for (int32 tri = 0; tri + 2 < MeshTriangles.Num(); tri += 3)
+	{
+		const int32 I[3] = { (int32)MeshTriangles[tri], (int32)MeshTriangles[tri + 1], (int32)MeshTriangles[tri + 2] };
+		const int32 NumPlus = (IsPlus(I[0]) ? 1 : 0) + (IsPlus(I[1]) ? 1 : 0) + (IsPlus(I[2]) ? 1 : 0);
+		if (NumPlus == 3 || NumPlus == 0)
+		{
+			NewTris.Add(I[0]); NewTris.Add(I[1]); NewTris.Add(I[2]); // wholly one side — keep
+			continue;
+		}
+
+		// Order-preserving split: walk the triangle's edges, sending each vertex to its side
+		// and each crossing's intersection to BOTH sides (preserves winding).
+		TArray<int32, TInlineAllocator<4>> Plus, Minus;
+		int32 PInter[2] = { -1, -1 }, MInter[2] = { -1, -1 }, NInter = 0;
+		for (int32 e = 0; e < 3; ++e)
+		{
+			const int32 A = I[e];
+			const int32 B = I[(e + 1) % 3];
+			const bool Ap = IsPlus(A), Bp = IsPlus(B);
+			(Ap ? Plus : Minus).Add(A);
+			if (Ap != Bp)
+			{
+				int32 Pi, Mi; GetInter(A, B, Pi, Mi);
+				Plus.Add(Pi); Minus.Add(Mi);
+				if (NInter < 2) { PInter[NInter] = Pi; MInter[NInter] = Mi; ++NInter; }
+			}
+		}
+
+		auto FanEmit = [&](const TArray<int32, TInlineAllocator<4>>& Poly)
+		{
+			for (int32 k = 1; k + 1 < Poly.Num(); ++k)
+			{
+				NewTris.Add(Poly[0]); NewTris.Add(Poly[k]); NewTris.Add(Poly[k + 1]);
+			}
+		};
+		FanEmit(Plus);
+		FanEmit(Minus);
+
+		if (NInter == 2)
+		{
+			if (PInter[0] != PInter[1]) PlusSegs.Add({ PInter[0], PInter[1] });
+			if (MInter[0] != MInter[1]) MinusSegs.Add({ MInter[0], MInter[1] });
+		}
+	}
+
+	// Cap the cross-section. The per-edge seam verts (degree 2) form closed loop(s); each loop
+	// is a simple polygon on the cut plane, triangulated by EAR CLIPPING (handles concave shapes
+	// and multiple separate loops without fanning across the gap). Cap verts reuse the seam verts,
+	// which are already embedded on their side, so each cap moves coherently with its half.
+	int32 NumCapTris = 0; // SB-M11 instrumentation
+	TArray<uint32> CapTriVerts; // SB-M11 debug: record emitted cap tris for visualization
+	auto EmitCapTri = [&](int32 A, int32 B, int32 C, const FVector3f& Target)
+	{
+		const FVector3f Fn = FVector3f::CrossProduct(NewRest[C] - NewRest[A], NewRest[B] - NewRest[A]);
+		if (FVector3f::DotProduct(Fn, Target) >= 0.0f)
+		{
+			NewTris.Add(A); NewTris.Add(B); NewTris.Add(C);
+		}
+		else
+		{
+			NewTris.Add(A); NewTris.Add(C); NewTris.Add(B);
+		}
+		CapTriVerts.Add(A); CapTriVerts.Add(B); CapTriVerts.Add(C);
+		++NumCapTris;
+	};
+
+	auto BuildCaps = [&](const TArray<TPair<int32, int32>>& Segs, const FVector3f& Target)
+	{
+		if (Segs.Num() == 0)
+		{
+			return;
+		}
+		// 2D basis on the cut plane (for the ear-clip area/containment tests).
+		const FVector3f Up = (FMath::Abs(LocalN.X) < 0.9f) ? FVector3f(1, 0, 0) : FVector3f(0, 1, 0);
+		const FVector3f U = FVector3f::CrossProduct(LocalN, Up).GetSafeNormal();
+		const FVector3f V = FVector3f::CrossProduct(LocalN, U);
+		auto To2D = [&](int32 Idx) { const FVector3f R = NewRest[Idx]; return FVector2f(FVector3f::DotProduct(R, U), FVector3f::DotProduct(R, V)); };
+
+		TMap<int32, TArray<int32>> Adj;
+		for (const TPair<int32, int32>& S : Segs)
+		{
+			Adj.FindOrAdd(S.Key).Add(S.Value);
+			Adj.FindOrAdd(S.Value).Add(S.Key);
+		}
+
+		TSet<int32> Visited;
+		for (const TPair<int32, int32>& S : Segs)
+		{
+			if (Visited.Contains(S.Key))
+			{
+				continue;
+			}
+			// Walk this loop following unvisited neighbours.
+			TArray<int32> Loop;
+			int32 Cur = S.Key, Prev = -1;
+			for (int32 Guard = 0; Guard <= Adj.Num(); ++Guard)
+			{
+				Loop.Add(Cur);
+				Visited.Add(Cur);
+				const TArray<int32>* Nbrs = Adj.Find(Cur);
+				if (!Nbrs) break;
+				int32 Next = -1;
+				for (int32 N : *Nbrs) { if (N != Prev && !Visited.Contains(N)) { Next = N; break; } }
+				if (Next < 0) break;
+				Prev = Cur; Cur = Next;
+			}
+			if (Loop.Num() < 3)
 			{
 				continue;
 			}
 
-			// Cell → tet base (matches BuildTets iteration order: Z outer, Y, X inner, 6/cell).
-			const int32 CellLinear = (Cz * CellsY + Cy) * CellsX + Cx;
-			const int32 TetBase = CellLinear * 6;
+			// Project to 2D and ear-clip (simple polygon). Make CCW first.
+			const int32 N = Loop.Num();
+			TArray<FVector2f> P2; P2.SetNumUninitialized(N);
+			for (int32 k = 0; k < N; ++k) { P2[k] = To2D(Loop[k]); }
+			float Area2 = 0.0f;
+			for (int32 k = 0; k < N; ++k) { const FVector2f& a = P2[k]; const FVector2f& b = P2[(k + 1) % N]; Area2 += a.X * b.Y - b.X * a.Y; }
 
-			for (int32 t = 0; t < 6; ++t)
+			TArray<int32> Rem; Rem.SetNumUninitialized(N); // working ring of loop-positions
+			for (int32 k = 0; k < N; ++k) { Rem[k] = (Area2 >= 0.0f) ? k : (N - 1 - k); }
+
+			auto Cross2 = [](const FVector2f& a, const FVector2f& b, const FVector2f& c)
+			{ return (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X); };
+			auto InTri = [&](const FVector2f& p, const FVector2f& a, const FVector2f& b, const FVector2f& c)
 			{
-				const FSoftBodyTet& T = Tets[TetBase + t];
-				const FVector4f W = TetBarycentric(
-					InitialLocalPositions[T.V0], InitialLocalPositions[T.V1],
-					InitialLocalPositions[T.V2], InitialLocalPositions[T.V3], P);
+				const float d1 = Cross2(a, b, p), d2 = Cross2(b, c, p), d3 = Cross2(c, a, p);
+				const bool HasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+				const bool HasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+				return !(HasNeg && HasPos);
+			};
 
-				const float MinW = FMath::Min(FMath::Min(W.X, W.Y), FMath::Min(W.Z, W.W));
-				if (MinW > BestMin)
+			int32 Guard = 0;
+			while (Rem.Num() > 3 && Guard++ < N * N)
+			{
+				bool bClipped = false;
+				const int32 M = Rem.Num();
+				for (int32 i = 0; i < M; ++i)
 				{
-					BestMin = MinW;
-					BestTet = TetBase + t;
-					BestW = W;
+					const int32 Pa = Rem[(i + M - 1) % M], Pb = Rem[i], Pc = Rem[(i + 1) % M];
+					if (Cross2(P2[Pa], P2[Pb], P2[Pc]) <= 0.0f)
+					{
+						continue; // reflex (CCW ring) → not an ear
+					}
+					bool bAnyInside = false;
+					for (int32 j = 0; j < M; ++j)
+					{
+						const int32 Pj = Rem[j];
+						if (Pj == Pa || Pj == Pb || Pj == Pc) continue;
+						if (InTri(P2[Pj], P2[Pa], P2[Pb], P2[Pc])) { bAnyInside = true; break; }
+					}
+					if (bAnyInside) continue;
+					EmitCapTri(Loop[Pa], Loop[Pb], Loop[Pc], Target);
+					Rem.RemoveAt(i);
+					bClipped = true;
+					break;
 				}
-				if (MinW >= 0.0f)
+				if (!bClipped)
 				{
-					// Fully contained — can't do better than this.
-					dx = dy = dz = 2; // break all three loops
+					// Ear-clip stalled (near-degenerate / slightly non-simple 2D projection — e.g.
+					// the convex-clamp inset perturbs the loop). Rather than leave a HOLE in the cap
+					// (the remaining hollow patches), fan-fill the leftover ring from its first vertex.
+					// May add a few thin/overlapping tris, but the material is two-sided so it just
+					// closes the face. This guarantees a watertight cap.
+					for (int32 k = 1; k + 1 < Rem.Num(); ++k)
+					{
+						EmitCapTri(Loop[Rem[0]], Loop[Rem[k]], Loop[Rem[k + 1]], Target);
+					}
+					Rem.Reset();
 					break;
 				}
 			}
+			if (Rem.Num() == 3)
+			{
+				EmitCapTri(Loop[Rem[0]], Loop[Rem[1]], Loop[Rem[2]], Target);
+			}
 		}
+	};
+	BuildCaps(PlusSegs, -LocalN); // + half's cut face looks toward the removed material (−N)
+	BuildCaps(MinusSegs, LocalN);
 
-		// If the best tet doesn't strictly contain the vertex (slightly outside), clamp the
-		// weights to the tet's convex hull so it stays glued instead of flying off.
-		if (BestMin < 0.0f)
+	// Re-bind ORIGINAL verts whose tet now spans more than one chunk (torn by THIS cut or a prior
+	// one → the vert would smear/sheet across the gap). Move them to an intact tet within their own
+	// chunk (VertComponent). Verts whose tet is wholly in one chunk keep their binding (no pop).
+	int32 NumRebinds = 0; // SB-M11 instrumentation
+	for (int32 i = 0; i < OrigVerts; ++i)
+	{
+		if (bHaveComp && TetMultiComp(NewTet[i]) && VertComponent[i] != INDEX_NONE)
 		{
-			FVector4f W = BestW;
-			W.X = FMath::Max(W.X, 0.0f);
-			W.Y = FMath::Max(W.Y, 0.0f);
-			W.Z = FMath::Max(W.Z, 0.0f);
-			W.W = FMath::Max(W.W, 0.0f);
-			const float Sum = W.X + W.Y + W.Z + W.W;
-			BestW = (Sum > KINDA_SMALL_NUMBER) ? (W * (1.0f / Sum)) : FVector4f(0.25f, 0.25f, 0.25f, 0.25f);
+			EmbedPointRest(NewRest[i], NewTet[i], NewW[i], &ParticleComponent, VertComponent[i]);
+			++NumRebinds;
 		}
-
-		EmbedTet[v] = BestTet;
-		EmbedWeights[v] = BestW;
 	}
+
+	// Commit the new geometry. Per-frame scratch (MeshLocalPositions/Normals/Tangents) is
+	// resized in UpdateMeshFromSimulation; MeshVertWeights is init-only (cage stiffness) so
+	// its staleness is harmless.
+	MeshRestPositions = MoveTemp(NewRest);
+	MeshUV0           = MoveTemp(NewUV);
+	EmbedTet          = MoveTemp(NewTet);
+	EmbedWeights      = MoveTemp(NewW);
+	MeshTriangles     = MoveTemp(NewTris);
+	NumMeshVerts      = MeshRestPositions.Num();
+	DebugCapTriVerts.Append(CapTriVerts); // SB-M11 debug: caps from this cut (indices stay valid)
+
+#if !UE_BUILD_SHIPPING
+	// TEMP SB-M11 instrumentation: REST reconstruction error per vert (embedding vs rest position).
+	// With convex same-side binding this is no longer exactly 0 for seam verts — it equals the
+	// clamp inset, which should be SMALL (well under a cage cell); a large value would mean a vert
+	// bound to a far tet (potential residual sheet). Originals far from the cut stay ~0.
+	{
+		float MaxRestErr = 0.0f;
+		int32 WorstVert = INDEX_NONE;
+		for (int32 v = 0; v < NumMeshVerts; ++v)
+		{
+			if (!Tets.IsValidIndex(EmbedTet[v])) { continue; }
+			const FSoftBodyTet& T = Tets[EmbedTet[v]];
+			const FVector4f& W = EmbedWeights[v];
+			const FVector3f Rec =
+				W.X * InitialLocalPositions[T.V0] + W.Y * InitialLocalPositions[T.V1] +
+				W.Z * InitialLocalPositions[T.V2] + W.W * InitialLocalPositions[T.V3];
+			const float Err = (Rec - MeshRestPositions[v]).Size();
+			if (Err > MaxRestErr) { MaxRestErr = Err; WorstVert = v; }
+		}
+		// multiCompBinds = verts whose final tet spans MORE THAN ONE chunk (torn across a cut). This
+		// is the spike/sheet culprit and is INVISIBLE to maxRestErr (a torn tet is intact at rest).
+		// With component-routed binding it should be ~0; any residual = verts with no intact tet in
+		// their chunk within the search radius. NumChunks = connected components (≈ pieces so far).
+		int32 MultiCompBinds = -1;
+		int32 NumChunks = -1;
+		if (bHaveComp)
+		{
+			MultiCompBinds = 0;
+			for (int32 v = 0; v < NumMeshVerts; ++v)
+			{
+				if (TetMultiComp(EmbedTet[v])) { ++MultiCompBinds; }
+			}
+			TSet<int32> Roots;
+			for (int32 p = 0; p < NumParticles; ++p) { Roots.Add(ParticleComponent[p]); }
+			NumChunks = Roots.Num();
+		}
+		UE_LOG(LogTemp, Warning,
+			TEXT("[SB-M11] cut: verts %d->%d, +segs %d, -segs %d, capTris %d, rebinds %d, maxRestErr %.4f cm (vert %d), multiCompBinds %d, chunks %d"),
+			OrigVerts, NumMeshVerts, PlusSegs.Num(), MinusSegs.Num(), NumCapTris, NumRebinds, MaxRestErr, WorstVert, MultiCompBinds, NumChunks);
+	}
+#endif
 }
 
 void USoftBodyComponent::BuildParticleWeights()
@@ -959,16 +1430,21 @@ FPrimitiveSceneProxy* USoftBodyComponent::CreateSceneProxy()
 		return nullptr;
 	}
 
-	// Seed the proxy with the initial (rest) mesh; normals computed from its triangles.
+	// Seed positions: prefer the current DEFORMED verts when available (so recreating the proxy
+	// after a cut doesn't flash the rest pose for a frame); otherwise the rest pose. Box mode and
+	// first-time creation use rest.
+	const TArray<FVector3f>& SeedPos =
+		(bMeshMode && MeshLocalPositions.Num() == NumV) ? MeshLocalPositions : RestPos;
+
 	TArray<FVector3f> SeedNormals, SeedTangents;
-	ComputeNormalsTangents(RestPos, RenderTris, SeedNormals, SeedTangents);
+	ComputeNormalsTangents(SeedPos, RenderTris, SeedNormals, SeedTangents);
 
 	TArray<FDynamicMeshVertex> Vertices;
 	Vertices.SetNumUninitialized(NumV);
 	for (int32 i = 0; i < NumV; ++i)
 	{
 		FDynamicMeshVertex& V = Vertices[i];
-		V.Position = RestPos[i];
+		V.Position = SeedPos[i];
 		V.TextureCoordinate[0] = RenderUV[i];
 		V.TangentX = SeedTangents[i];
 		V.TangentZ = SeedNormals[i];
@@ -1234,6 +1710,29 @@ void USoftBodyComponent::UpdateMeshFromSimulation()
 
 		ComputeNormalsTangents(MeshLocalPositions, MeshTriangles, MeshNormals, MeshTangents);
 
+#if !UE_BUILD_SHIPPING
+		// TEMP SB-M11 debug: draw the cut-face cap triangles (green) over the deformed mesh so we
+		// can see whether the caps are generated and sit flush across the opening.
+		if (bDrawDebugPoints && DebugCapTriVerts.Num() >= 3)
+		{
+			if (UWorld* DbgWorld = GetWorld())
+			{
+				const FTransform& X = GetComponentTransform();
+				for (int32 t = 0; t + 2 < DebugCapTriVerts.Num(); t += 3)
+				{
+					const uint32 a = DebugCapTriVerts[t], b = DebugCapTriVerts[t + 1], c = DebugCapTriVerts[t + 2];
+					if ((int32)a >= NumMeshVerts || (int32)b >= NumMeshVerts || (int32)c >= NumMeshVerts) { continue; }
+					const FVector PA = X.TransformPosition(FVector(MeshLocalPositions[a]));
+					const FVector PB = X.TransformPosition(FVector(MeshLocalPositions[b]));
+					const FVector PC = X.TransformPosition(FVector(MeshLocalPositions[c]));
+					DrawDebugLine(DbgWorld, PA, PB, FColor::Green, false, -1.0f, SDPG_World, 0.4f);
+					DrawDebugLine(DbgWorld, PB, PC, FColor::Green, false, -1.0f, SDPG_World, 0.4f);
+					DrawDebugLine(DbgWorld, PC, PA, FColor::Green, false, -1.0f, SDPG_World, 0.4f);
+				}
+			}
+		}
+#endif
+
 		ENQUEUE_RENDER_COMMAND(SoftBodyMeshUpdate)(
 			[Proxy, Positions = MeshLocalPositions, Normals = MeshNormals, Tangents = MeshTangents]
 			(FRHICommandListImmediate& RHICmdList)
@@ -1332,28 +1831,61 @@ void USoftBodyComponent::UpdateMouseGrab()
 		}
 
 		float BestDistSq = TNumericLimits<float>::Max();
-		int32 BestIndex = INDEX_NONE;
+		int32 BestIndex = INDEX_NONE;   // cage particle to grab
 		float BestDepth = 0.0f;
 
-		for (int32 Idx : BoundaryParticles)
+		if (bMeshMode && MeshLocalPositions.Num() == NumMeshVerts && NumMeshVerts > 0)
 		{
-			const FVector P(RenderResources->PositionCopy[Idx]);
-			const float Depth = FVector::DotProduct(P - RayOrigin, RayDir);
-			if (Depth <= 0.0f)
+			// Custom mesh: the grabbable surface is the EMBEDDED MESH, not the (padded, box-shaped)
+			// cage boundary. Pick the deformed mesh vertex nearest the click ray, then grab the cage
+			// particle that drives it (its tet's highest-weight particle). Without this, a click on
+			// the visible mesh found no cage-boundary particle within reach, so dragging often failed.
+			const FTransform X = GetComponentTransform();
+			int32 BestVert = INDEX_NONE;
+			for (int32 v = 0; v < NumMeshVerts; ++v)
 			{
-				continue; // behind the camera
+				const FVector P = X.TransformPosition(FVector(MeshLocalPositions[v]));
+				const float Depth = FVector::DotProduct(P - RayOrigin, RayDir);
+				if (Depth <= 0.0f) { continue; } // behind the camera
+				const FVector Closest = RayOrigin + RayDir * Depth;
+				const float DistSq = FVector::DistSquared(P, Closest);
+				if (DistSq < BestDistSq) { BestDistSq = DistSq; BestVert = v; BestDepth = Depth; }
 			}
-			const FVector Closest = RayOrigin + RayDir * Depth;
-			const float DistSq = FVector::DistSquared(P, Closest);
-			if (DistSq < BestDistSq)
+			if (BestVert != INDEX_NONE && Tets.IsValidIndex(EmbedTet[BestVert]))
 			{
-				BestDistSq = DistSq;
-				BestIndex = Idx;
-				BestDepth = Depth;
+				const FSoftBodyTet& T = Tets[EmbedTet[BestVert]];
+				const FVector4f& W = EmbedWeights[BestVert];
+				int32 Best = T.V0; float Bw = W.X;
+				if (W.Y > Bw) { Bw = W.Y; Best = T.V1; }
+				if (W.Z > Bw) { Bw = W.Z; Best = T.V2; }
+				if (W.W > Bw) { Bw = W.W; Best = T.V3; }
+				BestIndex = Best;
+			}
+		}
+		else
+		{
+			for (int32 Idx : BoundaryParticles)
+			{
+				const FVector P(RenderResources->PositionCopy[Idx]);
+				const float Depth = FVector::DotProduct(P - RayOrigin, RayDir);
+				if (Depth <= 0.0f)
+				{
+					continue; // behind the camera
+				}
+				const FVector Closest = RayOrigin + RayDir * Depth;
+				const float DistSq = FVector::DistSquared(P, Closest);
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					BestIndex = Idx;
+					BestDepth = Depth;
+				}
 			}
 		}
 
-		const float PickRadius = EffectiveSpacing * GrabPickRadiusScale;
+		// Mesh picks land right on the visible surface (tiny dist); the box-cage pick uses the cage
+		// spacing. Allow a generous radius for the mesh path so clicks near the surface still catch.
+		const float PickRadius = EffectiveSpacing * GrabPickRadiusScale * (bMeshMode ? 4.0f : 1.0f);
 		if (BestIndex != INDEX_NONE && BestDistSq <= PickRadius * PickRadius)
 		{
 			GrabbedIndex = BestIndex;
@@ -1386,6 +1918,21 @@ void USoftBodyComponent::UpdateCut()
 	const bool bDown = PC->IsInputKeyDown(EKeys::RightMouseButton);
 	FVector RayO, RayD;
 	const bool bRay = PC->DeprojectMousePositionToWorld(RayO, RayD);
+
+	// Freeze the camera while the right button is held so a cut swipe slices instead of also
+	// rotating the view (you can hold RMB and drag across the body to define the cut plane). Look
+	// input is restored the moment the button is released. Balanced so the ignore counter returns
+	// to 0; also reset in EndPlay in case we're destroyed mid-stroke.
+	if (bDown && !bCutLookSuppressed)
+	{
+		PC->SetIgnoreLookInput(true);
+		bCutLookSuppressed = true;
+	}
+	else if (!bDown && bCutLookSuppressed)
+	{
+		PC->SetIgnoreLookInput(false);
+		bCutLookSuppressed = false;
+	}
 
 	// Press: record the stroke start ray.
 	if (bDown && !bCutStrokeActive)
@@ -1457,6 +2004,25 @@ void USoftBodyComponent::UpdateCut()
 			}
 		}
 
+		// Mark every particle that has lost a distance constraint (across ALL cuts) — these sit on
+		// a cut surface. A tet touching one is under-constrained: it can invert once unsupported,
+		// and the PBD volume solve then OVER-corrects the inverted tet and launches its particles
+		// outward (the spikes that vanished at VolumeStiffness=0). So we drop the volume constraint
+		// of any tet touching a cut-surface particle: a one-tet shell around each cut gives up
+		// volume preservation (stays stable via its distance constraints) while the interior keeps
+		// its jelly. Built from the full broken set so it also covers straddling tets.
+		TArray<uint8> CutParticle;
+		CutParticle.Init(0, NumParticles);
+		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+		{
+			if (DistanceBrokenCPU[i] != 0)
+			{
+				const FGPUConstraint& C = DistanceConstraintsCPU[i];
+				CutParticle[C.IndexA] = 1;
+				CutParticle[C.IndexB] = 1;
+			}
+		}
+
 		for (int32 t = 0; t < VolumeConstraintsCPU.Num(); ++t)
 		{
 			if (VolumeBrokenCPU[t] != 0)
@@ -1464,11 +2030,10 @@ void USoftBodyComponent::UpdateCut()
 				continue;
 			}
 			const FGPUVolumeConstraint& V = VolumeConstraintsCPU[t];
-			const float S0 = Side(V.I0), S1 = Side(V.I1), S2 = Side(V.I2), S3 = Side(V.I3);
-			const float MinS = FMath::Min(FMath::Min(S0, S1), FMath::Min(S2, S3));
-			const float MaxS = FMath::Max(FMath::Max(S0, S1), FMath::Max(S2, S3));
-			if (MinS < 0.0f && MaxS > 0.0f) // tet straddles the plane → remove it
+			if (CutParticle[V.I0] || CutParticle[V.I1] || CutParticle[V.I2] || CutParticle[V.I3])
 			{
+				// Straddling OR boundary tet (touches the cut surface) → remove volume to stop the
+				// inversion blow-up. (Straddling tets are a subset: all their particles are cut.)
 				VolumeBrokenCPU[t] = 1u;
 				bAnyCut = true;
 			}
@@ -1491,10 +2056,10 @@ void USoftBodyComponent::UpdateCut()
 			});
 	}
 
-	// Re-extract the boundary surface so the cut opens up (box/lattice mode), and hand the
-	// new index buffer to the proxy. (Embedded meshes tear physically but aren't re-extracted.)
 	if (!bMeshMode)
 	{
+		// Box/lattice: re-extract the boundary surface from surviving tets so the cut opens up,
+		// and hand the new index buffer to the proxy (SB-M10).
 		BuildTetBoundarySurface();
 		if (FSoftBodyMeshSceneProxy* Proxy = static_cast<FSoftBodyMeshSceneProxy*>(SceneProxy))
 		{
@@ -1503,6 +2068,45 @@ void USoftBodyComponent::UpdateCut()
 				{
 					Proxy->UpdateIndices_RenderThread(NewTris);
 				});
+		}
+	}
+	else if (MeshLocalPositions.Num() == NumMeshVerts && NumMeshVerts > 0)
+	{
+		// Embedded custom mesh (SB-M11): split the render mesh along the cut plane (in local
+		// space) and cap it, then recreate the proxy with the new geometry (vertex count grows).
+
+		// Connected components of cage particles over the SURVIVING distance constraints (= the
+		// physical chunks after ALL cuts so far). Each mesh vert is then re-bound to a tet inside
+		// its own chunk, so a tet torn across an earlier cut can never blend two chunks (which was
+		// the 2nd-cut spanning-sheet bug). Union-find with path halving; cuts are infrequent.
+		TArray<int32> ParticleComponent;
+		ParticleComponent.SetNumUninitialized(NumParticles);
+		for (int32 p = 0; p < NumParticles; ++p) { ParticleComponent[p] = p; }
+		auto Find = [&](int32 X) -> int32
+		{
+			while (ParticleComponent[X] != X)
+			{
+				ParticleComponent[X] = ParticleComponent[ParticleComponent[X]];
+				X = ParticleComponent[X];
+			}
+			return X;
+		};
+		for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+		{
+			if (DistanceBrokenCPU[i] != 0) { continue; }
+			const FGPUConstraint& C = DistanceConstraintsCPU[i];
+			const int32 RA = Find((int32)C.IndexA), RB = Find((int32)C.IndexB);
+			if (RA != RB) { ParticleComponent[RA] = RB; }
+		}
+		for (int32 p = 0; p < NumParticles; ++p) { ParticleComponent[p] = Find(p); }
+
+		const FTransform WorldToLocal = GetComponentTransform().Inverse();
+		const FVector3f LocalP(WorldToLocal.TransformPosition(PlanePoint));
+		const FVector3f LocalN = FVector3f(WorldToLocal.TransformVector(Normal)).GetSafeNormal();
+		if (!LocalN.IsNearlyZero())
+		{
+			ClipMeshAlongPlane(LocalP, LocalN, ParticleComponent);
+			MarkRenderStateDirty(); // rebuild the proxy from the new Mesh* arrays via CreateSceneProxy
 		}
 	}
 }
@@ -1539,6 +2143,19 @@ void USoftBodyComponent::DrawDebug()
 
 void USoftBodyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	// Restore camera look input if we were suppressing it for a cut stroke (SB-M11).
+	if (bCutLookSuppressed)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (APlayerController* PC = World->GetFirstPlayerController())
+			{
+				PC->SetIgnoreLookInput(false);
+			}
+		}
+		bCutLookSuppressed = false;
+	}
+
 	// Stop participating in inter-body collision before our resources are released (SB-M9).
 	if (UWorld* World = GetWorld())
 	{

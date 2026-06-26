@@ -396,6 +396,21 @@ private:
 	 *  barycentric weights, so the mesh can be reconstructed from the deformed cage (SB-M5). */
 	void BuildEmbedding();
 
+	/** Embed a single REST-space point into the rest cage (containing tet + barycentric weights),
+	 *  via a cell search. When ParticleComponent is supplied and RequiredComponent != INDEX_NONE,
+	 *  only tets whose 4 cage particles are ALL in RequiredComponent (one physical chunk) are
+	 *  accepted, with a widened search; falls back to the unfiltered best if none is reachable.
+	 *  This binds a vert to its own chunk after one or more cuts (SB-M5 / SB-M11). */
+	void EmbedPointRest(const FVector3f& RestP, int32& OutTet, FVector4f& OutWeights,
+		const TArray<int32>* ParticleComponent = nullptr, int32 RequiredComponent = INDEX_NONE) const;
+
+	/** Split the embedded render mesh along a local-space plane and cap the cross-section, so a cut
+	 *  opens the mesh into solid-looking halves (SB-M11). Rebuilds the Mesh* arrays + embedding.
+	 *  ParticleComponent (connected-component id per cage particle over surviving constraints =
+	 *  physical chunk) re-binds each vert to a tet within its own chunk, so accumulated cuts stay
+	 *  watertight (side alone can't tell two chunks apart once the body has been cut twice). */
+	void ClipMeshAlongPlane(const FVector3f& LocalP, const FVector3f& LocalN, const TArray<int32>& ParticleComponent);
+
 	/** Sample the mesh's per-vertex paint weight onto each cage particle (nearest mesh
 	 *  vertex), producing ParticleWeights. No-op (clears data) when weight paint is off,
 	 *  there's no mesh, or the mesh has no vertex colors (SB-M6). */
@@ -491,8 +506,16 @@ private:
 	bool    bCutStrokeActive = false;
 	FVector CutStrokeStartOrigin = FVector::ZeroVector;
 	FVector CutStrokeStartDir = FVector::ZeroVector;
+	// True while we're suppressing the controller's look input so a cut swipe doesn't also rotate
+	// the camera (balanced SetIgnoreLookInput calls; restored on release / EndPlay).
+	bool    bCutLookSuppressed = false;
 
 	FBoxSphereBounds LocalBounds = FBoxSphereBounds(ForceInit);
+
+	// TEMP SB-M11 debug: cut-face cap triangles (mesh-vertex index triples), accumulated across
+	// cuts. Drawn as a green wireframe over the deformed mesh when bDrawDebugPoints is on, to verify
+	// the caps are generated and sit flush across the cut opening (diagnosing the hollow faces).
+	TArray<uint32> DebugCapTriVerts;
 
 	// Shared with render command lambdas so GPU work outlives this component safely.
 	TSharedPtr<FSoftBodyRenderResources> RenderResources;
