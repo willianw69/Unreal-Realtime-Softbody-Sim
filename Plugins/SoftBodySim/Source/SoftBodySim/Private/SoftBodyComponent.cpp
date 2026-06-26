@@ -1484,6 +1484,9 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 	// Hold Shift to freeze the camera while dragging / cutting (global modifier).
 	UpdateCameraFreeze();
 
+	// "Rip apart" demo (hold T) — owns the grab when active.
+	UpdateRip(DeltaTime);
+
 	// Mouse pick/drag — updates GrabbedIndex / CurrentGrabTarget for the params below.
 	UpdateMouseGrab();
 
@@ -1554,12 +1557,26 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 		Params.Colliders.Add(G);
 	}
 
-	// Mouse grab (SB-M3 + cluster grab) — pull the whole grabbed region toward the cursor. Each
-	// particle's target is the cursor target plus its offset within the region (rigid translation).
-	Params.bGrabActive   = bIsGrabbing && GrabbedParticles.Num() > 0;
+	// Grab (SB-M3 + cluster grab). Driven by the rip-apart demo when active, else the mouse drag.
 	Params.GrabStiffness = GrabStiffness;
-	if (Params.bGrabActive)
+	if (bRipActive && RipGripParticles.Num() > 0)
 	{
+		// Each grip pulls from its start position outward along its direction (limb-from-limb).
+		Params.bGrabActive = true;
+		const float Dist = RipSpeed * RipElapsed;
+		Params.GrabPoints.Reset(RipGripParticles.Num());
+		for (int32 k = 0; k < RipGripParticles.Num(); ++k)
+		{
+			FGPUGrab G;
+			G.Index  = (uint32)RipGripParticles[k];
+			G.Target = RipGripBase[k] + RipGripDir[k] * Dist;
+			Params.GrabPoints.Add(G);
+		}
+	}
+	else if (bIsGrabbing && GrabbedParticles.Num() > 0)
+	{
+		// Mouse drag — pull the grabbed region toward the cursor (rigid translation of the patch).
+		Params.bGrabActive = true;
 		const FVector3f Target(CurrentGrabTarget);
 		Params.GrabPoints.Reset(GrabbedParticles.Num());
 		for (int32 k = 0; k < GrabbedParticles.Num(); ++k)
@@ -1569,6 +1586,10 @@ void USoftBodyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 			G.Target = Target + GrabOffsets[k];
 			Params.GrabPoints.Add(G);
 		}
+	}
+	else
+	{
+		Params.bGrabActive = false;
 	}
 
 	// Fixed-timestep accumulator (frame-rate independent).
@@ -1827,6 +1848,11 @@ void USoftBodyComponent::UpdateMouseGrab()
 		GrabOffsets.Reset();
 	};
 
+	if (bRipActive)
+	{
+		return; // the rip-apart demo owns the grab while active (don't fight it / clear its grips)
+	}
+
 	if (!bEnableMouseDrag || !RenderResources.IsValid())
 	{
 		ClearGrab();
@@ -1991,6 +2017,101 @@ void USoftBodyComponent::UpdateCameraFreeze()
 		PC->SetIgnoreLookInput(false);
 		bLookSuppressed = false;
 	}
+}
+
+void USoftBodyComponent::UpdateRip(float DeltaTime)
+{
+	// "Rip apart" demo: hold T to grab several grips spread around the body and pull each outward in
+	// its own direction, so the body tears limb-from-limb (combine with bTearable). The grips are
+	// pulled via the same GPU grab pass; tear protection (UpdateTear) keeps the limbs intact so the
+	// body rips BETWEEN the grips.
+	auto Stop = [&]()
+	{
+		bRipActive = false;
+		RipGripParticles.Reset();
+		RipGripBase.Reset();
+		RipGripDir.Reset();
+	};
+
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!bRipApart || !PC || !RenderResources.IsValid())
+	{
+		Stop();
+		return;
+	}
+	if (!PC->IsInputKeyDown(EKeys::T))
+	{
+		Stop(); // released — let the pieces fly
+		return;
+	}
+
+	if (!bRipActive)
+	{
+		// Start of a rip: pick the grips from the current pose (readback world positions).
+		FScopeLock Lock(&RenderResources->PositionCopyCS);
+		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles || NumParticles == 0)
+		{
+			return; // readback not ready — try again next frame
+		}
+		const TArray<FVector3f>& P = RenderResources->PositionCopy;
+
+		FVector Centroid = FVector::ZeroVector;
+		for (int32 i = 0; i < NumParticles; ++i) { Centroid += FVector(P[i]); }
+		Centroid /= (double)NumParticles;
+
+		RipGripParticles.Reset();
+		RipGripBase.Reset();
+		RipGripDir.Reset();
+		TSet<int32> Assigned; // a particle belongs to at most one grip
+		const float GripR = EffectiveSpacing * RipGripRadiusScale;
+		const float GripRSq = GripR * GripR;
+		const int32 N = FMath::Max(2, RipGripCount);
+		const float GoldenAngle = PI * (3.0f - FMath::Sqrt(5.0f));
+
+		for (int32 g = 0; g < N; ++g)
+		{
+			// Evenly spread directions over a sphere (Fibonacci sphere).
+			const float Y = 1.0f - (g + 0.5f) * 2.0f / (float)N;
+			const float R = FMath::Sqrt(FMath::Max(0.0f, 1.0f - Y * Y));
+			const float Theta = (float)g * GoldenAngle;
+			const FVector Dir(R * FMath::Cos(Theta), R * FMath::Sin(Theta), Y);
+
+			// Farthest particle along this direction = the "limb tip" to grab.
+			int32 TipIdx = INDEX_NONE; float TipDot = -FLT_MAX;
+			for (int32 i = 0; i < NumParticles; ++i)
+			{
+				const float D = FVector::DotProduct(FVector(P[i]) - Centroid, Dir);
+				if (D > TipDot) { TipDot = D; TipIdx = i; }
+			}
+			if (TipIdx == INDEX_NONE) { continue; }
+
+			// Gather a cluster around the tip; each grip pulls straight out from the centroid.
+			const FVector Tip(P[TipIdx]);
+			const FVector OutDir = (Tip - Centroid).GetSafeNormal(KINDA_SMALL_NUMBER, FVector(Dir));
+			for (int32 i = 0; i < NumParticles; ++i)
+			{
+				if (Assigned.Contains(i)) { continue; }
+				if (FVector::DistSquared(FVector(P[i]), Tip) <= GripRSq)
+				{
+					Assigned.Add(i);
+					RipGripParticles.Add(i);
+					RipGripBase.Add(P[i]);
+					RipGripDir.Add(FVector3f(OutDir));
+				}
+			}
+		}
+
+		RipElapsed = 0.0f;
+		bRipActive = RipGripParticles.Num() > 0;
+	}
+	else
+	{
+		RipElapsed += DeltaTime; // advance the outward pull
+	}
+
+	// Expose the grips to the tear protection so the limbs stay whole and the body rips between them.
+	GrabbedParticles = RipGripParticles;
 }
 
 void USoftBodyComponent::UpdateCut()
@@ -2221,25 +2342,39 @@ void USoftBodyComponent::UpdateTear()
 	// still exceeds this relaxed threshold and tears the dragged patch away. 1.0 = no extra resistance.
 	const float GrabThreshSq = FMath::Square(Thresh * FMath::Max(1.0f, GrabTearResistance));
 
-	// Identify the grabbed region + its 1-ring (these use the relaxed threshold below).
-	TArray<uint8> Protected;
-	const bool bProtect = bIsGrabbing && GrabbedParticles.Num() > 0;
+	// Mark the grabbed particles. Only links INTERNAL to a grip (both ends grabbed) get the relaxed
+	// threshold, so each grip stays a rigid handle — but the BOUNDARY links (grip ↔ body) tear at
+	// the normal threshold, which is exactly where a limb rips off WHILE you pull (not on release).
+	TArray<uint8> Grabbed;
+	const bool bProtect = (bIsGrabbing || bRipActive) && GrabbedParticles.Num() > 0;
 	if (bProtect)
 	{
-		// Protect the whole grabbed region and its 1-ring (read grabbed flags from a separate array
-		// so neighbours don't cascade past one ring).
-		TArray<uint8> Grabbed; Grabbed.Init(0, NumParticles);
+		Grabbed.Init(0, NumParticles);
 		for (int32 g : GrabbedParticles) { if (g >= 0 && g < NumParticles) { Grabbed[g] = 1; } }
-		Protected = Grabbed;
-		for (const FGPUConstraint& C : DistanceConstraintsCPU)
+	}
+
+	// Crack propagation: a link whose endpoint is ALREADY torn tears at a lower bar, so once a tear
+	// seeds at the most-stressed point it runs to completion (a real separation) instead of eroding
+	// scattered links that never disconnect the body. Seeds still require the full threshold.
+	const float PropThreshSq = FMath::Square(FMath::Max(1.05f, Thresh * 0.6f));
+	TArray<uint8> Torn;
+	Torn.Init(0, NumParticles);
+	for (int32 i = 0; i < DistanceConstraintsCPU.Num(); ++i)
+	{
+		if (DistanceBrokenCPU[i] != 0)
 		{
-			if (Grabbed[C.IndexA]) { Protected[C.IndexB] = 1; }
-			if (Grabbed[C.IndexB]) { Protected[C.IndexA] = 1; }
+			const FGPUConstraint& C = DistanceConstraintsCPU[i];
+			Torn[C.IndexA] = 1; Torn[C.IndexB] = 1;
 		}
 	}
 
-	// Sever every link stretched past RestLength * threshold, using the latest readback positions.
-	bool bAnyTear = false;
+	// Find over-stretched links. Each is either CONTINUING a crack (an endpoint already torn) or
+	// a new SEED. We spend the per-check budget on propagation first + only a few new seeds, so a
+	// tear runs along a front to completion (real separation) instead of nucleating everywhere and
+	// shattering the body (which also explodes the surface triangle count → lag).
+	struct FTearCand { int32 Index; float Excess; uint8 Prop; };
+	TArray<FTearCand> Cands;
+	float DbgMaxStrain = 0.0f; // TEMP: largest current/rest ratio seen (any link), to diagnose tearing
 	{
 		FScopeLock Lock(&RenderResources->PositionCopyCS);
 		if (!RenderResources->bHasPositionData || RenderResources->PositionCopy.Num() != NumParticles)
@@ -2253,21 +2388,60 @@ void USoftBodyComponent::UpdateTear()
 			if (DistanceBrokenCPU[i] != 0) { continue; }
 			const FGPUConstraint& C = DistanceConstraintsCPU[i];
 			if (C.RestLength <= KINDA_SMALL_NUMBER) { continue; }
-			// Links in the grabbed region use the relaxed (harder) threshold; the rest use the normal one.
-			const bool bInGrab = bProtect && (Protected[C.IndexA] || Protected[C.IndexB]);
-			const float UseThreshSq = bInGrab ? GrabThreshSq : ThreshSq;
+			// Pick the bar: links INSIDE a grip resist most (stay a rigid handle); links at a crack
+			// tip tear easiest (propagation); else normal. Grip BOUNDARY links use the normal bar, so
+			// a limb rips off at its base during the pull.
+			const bool bInGrab = bProtect && Grabbed[C.IndexA] && Grabbed[C.IndexB];
+			const bool bAtCrack = (Torn[C.IndexA] || Torn[C.IndexB]);
+			const float UseThreshSq = bInGrab ? GrabThreshSq : (bAtCrack ? PropThreshSq : ThreshSq);
+			const float Limit = UseThreshSq * C.RestLength * C.RestLength;
 			const float LenSq = FVector3f::DistSquared(P[C.IndexA], P[C.IndexB]);
-			if (LenSq > UseThreshSq * C.RestLength * C.RestLength) // stretched past the tear threshold
+			DbgMaxStrain = FMath::Max(DbgMaxStrain, LenSq / (C.RestLength * C.RestLength));
+			if (LenSq > Limit) // stretched past its tear threshold
 			{
-				DistanceBrokenCPU[i] = 1u;
-				bAnyTear = true;
+				Cands.Add({ i, LenSq / Limit, bAtCrack ? (uint8)1 : (uint8)0 });
 			}
 		}
 	}
 
-	if (!bAnyTear)
+#if !UE_BUILD_SHIPPING
+	// TEMP diagnostic. ripApart/Tdown tell us if the rip is even engaging; cap vs candidates tells us
+	// if the per-check limit is throttling separation.
+	APlayerController* DbgPC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	const int32 DbgTDown = (DbgPC && DbgPC->IsInputKeyDown(EKeys::T)) ? 1 : 0;
+	UE_LOG(LogTemp, Warning,
+		TEXT("[SB-M12 tear] ripApart=%d Tdown=%d ripActive=%d maxStrain=%.2f thresh=%.2f candidates=%d cap=%d"),
+		bRipApart ? 1 : 0, DbgTDown, bRipActive ? 1 : 0, FMath::Sqrt(DbgMaxStrain), TearStrainThreshold, Cands.Num(), MaxTearsPerCheck);
+#endif
+
+	if (Cands.Num() == 0)
 	{
 		return;
+	}
+
+	// Spend the budget: PROPAGATION first (continue existing cracks), then only a few new SEEDS.
+	// Sorted so crack-tip links (Prop) come first, most-stretched within each group. This makes a
+	// tear run along a connected front to completion at a gradual rate, and caps new crack starts so
+	// the body doesn't nucleate-and-shatter everywhere (keeps it gradual AND bounds the cost).
+	Cands.Sort([](const FTearCand& A, const FTearCand& B)
+	{
+		if (A.Prop != B.Prop) { return A.Prop > B.Prop; } // propagation before seeds
+		return A.Excess > B.Excess;                       // most-stretched first
+	});
+
+	const int32 Cap = FMath::Max(1, MaxTearsPerCheck);
+	const int32 SeedCap = 6; // at most this many NEW cracks nucleate per check
+	int32 Broken = 0, Seeds = 0;
+	for (const FTearCand& Cd : Cands)
+	{
+		if (Broken >= Cap) { break; }
+		if (Cd.Prop == 0) // a new seed (not continuing a crack)
+		{
+			if (Seeds >= SeedCap) { continue; }
+			++Seeds;
+		}
+		DistanceBrokenCPU[Cd.Index] = 1u;
+		++Broken;
 	}
 
 	// Same anti-blow-up guard as cutting, then push the new broken flags to the GPU solver.

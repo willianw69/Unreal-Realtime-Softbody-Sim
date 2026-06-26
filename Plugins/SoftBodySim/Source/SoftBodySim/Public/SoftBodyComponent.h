@@ -330,6 +330,15 @@ public:
 	int32 TearCheckInterval = 2;
 
 	/**
+	 * How fast a tear advances: the max links that snap per scan, spent first on PROPAGATING the
+	 * crack front (then a few new cracks). Lower = the crack creeps slowly (body necks and rips bit
+	 * by bit); higher = it rips through fast. Very high effectively snaps in one frame. Tune together
+	 * with TearStrainThreshold (when it starts) and TearCheckInterval (how often it advances).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Cutting", meta = (ClampMin = "1", ClampMax = "2000", EditCondition = "bTearable"))
+	int32 MaxTearsPerCheck = 48;
+
+	/**
 	 * How much harder the region you're DRAGGING resists tearing, as a multiple of TearStrainThreshold.
 	 * The grab pins particles hard, so without this the handle would rip off instantly even on a gentle
 	 * drag. Higher = the dragged patch holds through stronger pulls; 1.0 = the dragged area tears as
@@ -354,6 +363,27 @@ public:
 	 *  the view rotating with the motion. A global modifier — works for every interaction. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction")
 	bool bHoldShiftToFreezeCamera = true;
+
+	/**
+	 * Enable the "rip apart" demo: with this on, HOLD **T** to grab several points around the body
+	 * at once and pull them outward in different directions, tearing it limb-from-limb (combine with
+	 * bTearable — the grips hold while the body rips between them). Release T to stop.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction")
+	bool bRipApart = false;
+
+	/** How many grips to grab around the body when ripping (spread evenly over a sphere). More =
+	 *  torn into more pieces. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "2", ClampMax = "16", EditCondition = "bRipApart"))
+	int32 RipGripCount = 6;
+
+	/** How fast each grip is pulled outward while ripping (cm/s). Higher = more violent. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "10.0", EditCondition = "bRipApart"))
+	float RipSpeed = 250.0f;
+
+	/** Size of each rip grip (multiples of cage spacing): how much of each "limb" is grabbed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.5", ClampMax = "20.0", EditCondition = "bRipApart"))
+	float RipGripRadiusScale = 2.0f;
 
 	/** How close (in multiples of Spacing) the click ray must pass to a surface particle to grab it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "SoftBody|Interaction", meta = (ClampMin = "0.25"))
@@ -493,6 +523,10 @@ private:
 	 *  cutting / pulling by moving the mouse doesn't rotate the view. Global, not tied to any one action. */
 	void UpdateCameraFreeze();
 
+	/** "Rip apart" demo (hold T): grab several grips spread around the body and pull each outward in
+	 *  its own direction, tearing it limb-from-limb (with bTearable). Reuses the multi-particle grab. */
+	void UpdateRip(float DeltaTime);
+
 	/** Draw readback positions as debug points (optional). */
 	void DrawDebug();
 
@@ -551,6 +585,14 @@ private:
 	// from the primary at grab time, so the whole region translates rigidly with the cursor.
 	TArray<int32>     GrabbedParticles;
 	TArray<FVector3f> GrabOffsets;
+
+	// "Rip apart" state (hold T). Each grip particle pulls from its base position outward along its
+	// direction at RipSpeed*RipElapsed, so several limbs pull away from the body at once.
+	bool              bRipActive = false;
+	float             RipElapsed = 0.0f;
+	TArray<int32>     RipGripParticles;
+	TArray<FVector3f> RipGripBase; // world pos at the start of the rip
+	TArray<FVector3f> RipGripDir;  // outward unit direction
 
 	// Scratch reused each frame for the proxy update (local space).
 	TArray<FVector3f> LocalPositions;
